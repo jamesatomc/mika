@@ -1,0 +1,104 @@
+[workspace]
+# Workspace configuration for the "kanari-sdk" project.
+# Defines the overall structure and settings for the workspace.
+# name = "kanari-sdk"
+resolver = "2"                   # Use the version 2 feature resolver for more consistent feature resolution.
+
+
+# Exclude List: Directories to be excluded from the workspace build.
+# This can be useful for excluding third-party code or components 
+# that are not directly part of the workspace's build process.
+exclude = [
+]
+
+
+# Members List: Crates that are part of this workspace.
+# These are the core components of the "kanari-" project.
+members = [
+      "crates/mika-storage",
+      "crates/mika-node",
+      "crates/mika-cli",
+]
+
+
+# Workspace Package Configuration: Metadata for the entire workspace as a package.
+# This information is used when publishing the SDK as a crate.
+[workspace.package]
+edition = "2024"                                                                               # Use Rust 2024 edition.
+categories = ["development-tools"]                                                             # Categorize as development tools on crates.io.
+keywords = ["blockchain"]     # Keywords for crates.io search.
+homepage = "https://kanarinetwork.site"                                                        # Project homepage.
+documentation = "https://docs.kanarinetwork.site"                                              # Link to project documentation.
+version = "0.0.1"                                                                              # Current version of the SDK.
+authors = ["Kanari Network"]                                                                   # Authors of the SDK.
+license = "Apache-2.0"                                                                         # License information.
+repository = "https://github.com/kanari-network/kanari-sdk"                                    # Link to the code repository.
+description = "Kanari Network SDK"                                                             # Short description of the SDK.
+
+
+# Dependencies that should be kept in sync through the whole workspace
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bcs = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+async-trait = "0.1.92"
+tempfile = "3"
+proptest = "1"
+rand = "0.8"
+axum = "0.7"
+tower-http = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+
+
+# ============================================================================
+# Workspace Members (Internal Crates)
+# ============================================================================
+kanari-crypto = { git = "https://github.com/kanari-network/kanari-sdk" }
+kanari-types = { git = "https://github.com/kanari-network/kanari-sdk" }
+
+
+[patch.crates-io]
+# libp2p-kad = { path = "third_party/patches/libp2p-kad-0.48.0" }
+# proc-macro-error2 = { path = "third_party/patches/proc-macro-error2-2.0.1" }
+
+
+# Profile Configurations: Define different build profiles for various scenarios.
+[profile.bench]                  # Profile for benchmarking.
+debug = true                     # Include debug information for profiling.
+opt-level = 3                    # Maximum optimization level for performance.
+lto = "thin"                     # Enable Link-Time Optimization (thin LTO for faster linking).
+codegen-units = 1                # Reduce codegen units to improve LTO effectiveness (may increase compile time).
+
+[profile.dev]                    # Profile for development builds.
+debug = false                    # Disable debug information for easier debugging.
+opt-level = 0                    # No optimization for faster compile times.
+split-debuginfo = "unpacked"     # Configure debug info splitting for better debugger experience.
+debug-assertions = true          # Enable debug assertions for development builds.
+overflow-checks = true           # Enable overflow checks for development builds.
+lto = false                      # Disable Link-Time Optimization for faster builds.
+panic = 'unwind'                 # Enable unwinding for panic handling.
+incremental = true               # Enable incremental compilation for faster builds.
+codegen-units = 256              # Increase codegen units for faster parallel compilation.
+
+[profile.ci]                     # Profile for Continuous Integration builds.
+inherits = "test"                # Inherit settings from the 'test' profile (if defined, otherwise defaults).
+debug = 0                        # Disable debug information for potentially faster and smaller builds.
+incremental = false              # Disable incremental compilation for cleaner and more reliable CI builds.
+codegen-units = 16               # Increase codegen units for potentially faster parallel compilation in CI.
+opt-level = 1                    # Moderate optimization level for a balance of speed and performance.
+
+[profile.release]                # Profile for release builds.
+opt-level = 3                    # Optimize for speed.
+debug = false                    # Disable debug information for release binaries.
+debug-assertions = false         # Disable debug assertions for release builds.
+overflow-checks = false          # Disable overflow checks for release builds.
+lto = false                      # Disable LTO to avoid compiler crash/OOM.
+panic = 'abort'                  # Remove unwinding code for panic handling.
+codegen-units = 16               # Keep release builds stable/reproducible while retaining parallel codegen.
+strip = true                     # Strip debug symbols from the final binary to reduce size.

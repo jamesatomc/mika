@@ -1,0 +1,27 @@
+[package]
+name = "mika-cli"
+edition.workspace = true
+categories.workspace = true
+keywords.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+mika-storage = { workspace = true }
+mika-node = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+kanari-crypto = { workspace = true }
+axum = { workspace = true }
+
+[[bin]]
+name = "mika-cli"
+path = "src/main.rs"

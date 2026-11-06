@@ -1,0 +1,32 @@
+[package]
+name = "mika-node"
+edition.workspace = true
+categories.workspace = true
+keywords.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+mika-storage = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+kanari-crypto = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+
+[[bin]]
+name = "mika-node"
+path = "src/main.rs"

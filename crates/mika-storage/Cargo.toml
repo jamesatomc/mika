@@ -1,0 +1,32 @@
+[package]
+name = "mika-storage"
+edition.workspace = true
+categories.workspace = true
+keywords.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bcs = { workspace = true }
+kanari-types = { workspace = true }
+kanari-crypto = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+async-trait = "0.1.92"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = []
