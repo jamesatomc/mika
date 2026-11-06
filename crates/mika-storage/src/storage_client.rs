@@ -12,6 +12,7 @@ use crate::error::{MikaStorageError, Result};
 use crate::sliver::Sliver;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Address of a storage node (host:port).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -68,6 +69,8 @@ pub struct MikaClient {
     /// Simulated remote storage: node_id -> (blob_id, shard_index) -> sliver bytes.
     /// In production this would be real HTTP calls to each node.
     store: std::sync::Arc<tokio::sync::RwLock<HashMap<(String, u32), Sliver>>>,
+    /// Optional on-disk path for the store so slivers survive across processes.
+    store_path: Option<PathBuf>,
 }
 
 impl MikaClient {
@@ -75,7 +78,45 @@ impl MikaClient {
         Self {
             nodes,
             store: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            store_path: None,
         }
+    }
+
+    /// Create a client that persists its store to `path`, loading any existing
+    /// data so uploads and lookups survive across separate CLI invocations.
+    pub fn with_store_path(nodes: Vec<NodeAddr>, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let store = if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| {
+                    serde_json::from_str::<Vec<((String, u32), Sliver)>>(&content).ok()
+                })
+                .map(|entries| entries.into_iter().collect::<HashMap<_, _>>())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        Self {
+            nodes,
+            store: std::sync::Arc::new(tokio::sync::RwLock::new(store)),
+            store_path: Some(path),
+        }
+    }
+
+    async fn save_store(&self) {
+        let Some(path) = &self.store_path else { return };
+        let entries = {
+            let store = self.store.read().await;
+            store
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<((String, u32), Sliver)>>()
+        };
+        let Ok(content) = serde_json::to_string_pretty(&entries) else {
+            return;
+        };
+        let _ = std::fs::write(path, content);
     }
 
     /// Erasure-code a blob and distribute its slivers across the configured nodes.
@@ -130,6 +171,7 @@ impl MikaClient {
             });
         }
         drop(store);
+        self.save_store().await;
 
         let lease = Lease::new(blob.id, 86400, fee);
         Ok((quorum, lease))
@@ -139,6 +181,7 @@ impl MikaClient {
     pub async fn get_blob(&self, blob_id: &BlobID, params: &ErasureParams) -> Result<Blob> {
         let n = params.total_shards();
         let mut present: Vec<Option<Vec<u8>>> = vec![None; n];
+        let mut original_len: Option<usize> = None;
         let store = self.store.read().await;
         for (i, present_slot) in present.iter_mut().enumerate().take(n) {
             // Try each node until we find the shard.
@@ -147,6 +190,9 @@ impl MikaClient {
                     && sliver.blob_id == *blob_id
                 {
                     *present_slot = Some(sliver.data.clone());
+                    if original_len.is_none() {
+                        original_len = Some(sliver.original_len as usize);
+                    }
                     break;
                 }
             }
@@ -154,7 +200,9 @@ impl MikaClient {
         drop(store);
 
         let data_shards = decode(&present, params)?;
-        let data = rejoin_shards(&data_shards, data_shards.iter().map(|s| s.len()).sum());
+        let original_len =
+            original_len.unwrap_or_else(|| data_shards.iter().map(|s| s.len()).sum());
+        let data = rejoin_shards(&data_shards, original_len);
         Ok(Blob::new(data))
     }
 }
@@ -162,8 +210,11 @@ impl MikaClient {
 #[async_trait::async_trait]
 impl StorageClient for MikaClient {
     async fn store_sliver(&self, node: &NodeAddr, sliver: &Sliver) -> Result<StoreResult> {
-        let mut store = self.store.write().await;
-        store.insert((node.0.clone(), sliver.shard_index), sliver.clone());
+        {
+            let mut store = self.store.write().await;
+            store.insert((node.0.clone(), sliver.shard_index), sliver.clone());
+        }
+        self.save_store().await;
         Ok(StoreResult {
             node_id: node.0.clone(),
             shard_index: sliver.shard_index,

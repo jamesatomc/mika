@@ -21,7 +21,11 @@ impl GFTables {
         for i in 0..255 {
             exp[i as usize] = x;
             log[x as usize] = i as u8;
-            x = gf_mul_raw(x, 2);
+            let high_bit_set = x & 0x80 != 0;
+            x = ((x << 1));
+            if high_bit_set {
+                x ^= 0x1d; // GF(2^8) reduction with polynomial 0x11d (generator 2)
+            }
         }
         for i in 255..512 {
             exp[i as usize] = exp[(i - 255) as usize];
@@ -134,7 +138,7 @@ impl ErasureParams {
 /// Coefficient for parity shard `p` (0-based) and data shard `d` (0-based).
 /// Systematic RS Vandermonde coefficient: alpha^(p+1 * d).
 fn rs_coeff(parity_index: usize, data_index: usize) -> u8 {
-    gf_pow((parity_index + 1) as u8, data_index as u32)
+    gf_pow(2u8, ((parity_index + 1) * data_index) as u32)
 }
 
 /// Encode `data_shards` shards into `total_shards` shards (systematic).
@@ -189,7 +193,9 @@ pub fn split_into_shards(data: &[u8], k: usize) -> Result<Vec<Vec<u8>>> {
         if start >= total {
             out.push(vec![0u8; shard_len]);
         } else {
-            out.push(data[start..end].to_vec());
+            let mut shard = data[start..end].to_vec();
+            shard.resize(shard_len, 0);
+            out.push(shard);
         }
     }
     Ok(out)
