@@ -165,8 +165,8 @@ pub fn encode(shards: &[Vec<u8>], params: &ErasureParams) -> Result<Vec<Vec<u8>>
         let parity_idx = params.data_shards + p;
         for byte in 0..shard_len {
             let mut acc: u8 = 0;
-            for d in 0..params.data_shards {
-                acc ^= gf_mul(rs_coeff(p, d), shards[d][byte]);
+            for (d, shard) in shards.iter().enumerate() {
+                acc ^= gf_mul(rs_coeff(p, d), shard[byte]);
             }
             out[parity_idx][byte] = acc;
         }
@@ -243,8 +243,8 @@ pub fn decode(shards: &[Option<Vec<u8>>], params: &ErasureParams) -> Result<Vec<
             matrix[r][idx] = 1;
         } else {
             let p = idx - k;
-            for d in 0..k {
-                matrix[r][d] = rs_coeff(p, d);
+            for (d, cell) in matrix[r].iter_mut().enumerate() {
+                *cell = rs_coeff(p, d);
             }
         }
     }
@@ -253,7 +253,7 @@ pub fn decode(shards: &[Option<Vec<u8>>], params: &ErasureParams) -> Result<Vec<
     // We solve M * x = b for each byte position independently.
     let mut data_shards = vec![vec![0u8; shard_len]; k];
 
-    for byte in 0..shard_len {
+    for (byte, _) in shards[chosen[0]].as_ref().unwrap().iter().enumerate() {
         // Build augmented matrix [M | b]
         let mut aug: Vec<Vec<u8>> = vec![vec![0u8; k + 1]; k];
         for r in 0..k {
@@ -267,8 +267,8 @@ pub fn decode(shards: &[Option<Vec<u8>>], params: &ErasureParams) -> Result<Vec<
         for col in 0..k {
             // Find pivot.
             let mut pivot = None;
-            for row in col..k {
-                if aug[row][col] != 0 {
+            for (row, aug_row) in aug.iter().enumerate().skip(col) {
+                if aug_row[col] != 0 {
                     pivot = Some(row);
                     break;
                 }
@@ -279,16 +279,19 @@ pub fn decode(shards: &[Option<Vec<u8>>], params: &ErasureParams) -> Result<Vec<
 
             // Normalize pivot row.
             let inv = gf_inv(aug[col][col])?;
-            for c in col..=k {
-                aug[col][c] = gf_mul(aug[col][c], inv);
+            for cell in aug[col][col..=k].iter_mut() {
+                *cell = gf_mul(*cell, inv);
             }
 
             // Eliminate other rows.
-            for row in 0..k {
-                if row != col && aug[row][col] != 0 {
-                    let factor = aug[row][col];
-                    for c in col..=k {
-                        aug[row][c] ^= gf_mul(factor, aug[col][c]);
+            let pivot_row = aug[col].clone();
+            for (row, aug_row) in aug.iter_mut().enumerate() {
+                if row != col && aug_row[col] != 0 {
+                    let factor = aug_row[col];
+                    for (cell, &pivot_cell) in
+                        aug_row[col..=k].iter_mut().zip(pivot_row[col..=k].iter())
+                    {
+                        *cell ^= gf_mul(factor, pivot_cell);
                     }
                 }
             }

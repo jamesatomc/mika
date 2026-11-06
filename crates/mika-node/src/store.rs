@@ -101,7 +101,7 @@ mod tests {
         let store = SliverStore::new(dir.path().to_path_buf()).unwrap();
         let blob_id = BlobID::from_content(b"store test");
         let params = ErasureParams::new(3, 2).unwrap();
-        let shards = encode(&[vec![1u8; 64]], &params).unwrap();
+        let shards = encode(&vec![vec![1u8; 64]; 3], &params).unwrap();
         let sliver = Sliver::new(blob_id, 0, 5, 3, 2, 64, shards[0].clone());
         store.put(&sliver).await.unwrap();
         assert!(store.has(&blob_id, 0).await);

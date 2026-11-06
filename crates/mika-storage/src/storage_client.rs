@@ -140,14 +140,14 @@ impl MikaClient {
         let n = params.total_shards();
         let mut present: Vec<Option<Vec<u8>>> = vec![None; n];
         let store = self.store.read().await;
-        for i in 0..n {
+        for (i, present_slot) in present.iter_mut().enumerate().take(n) {
             // Try each node until we find the shard.
             for node in &self.nodes {
-                if let Some(sliver) = store.get(&(node.0.clone(), i as u32)) {
-                    if sliver.blob_id == *blob_id {
-                        present[i] = Some(sliver.data.clone());
-                        break;
-                    }
+                if let Some(sliver) = store.get(&(node.0.clone(), i as u32))
+                    && sliver.blob_id == *blob_id
+                {
+                    *present_slot = Some(sliver.data.clone());
+                    break;
                 }
             }
         }
@@ -180,7 +180,7 @@ impl StorageClient for MikaClient {
         let store = self.store.read().await;
         let sliver = store
             .get(&(node.0.clone(), shard_index))
-            .and_then(|s| if s.blob_id == *blob_id { Some(s) } else { None })
+            .filter(|&s| s.blob_id == *blob_id)
             .ok_or_else(|| MikaStorageError::BlobNotFound(blob_id.to_hex()))?;
         Ok(RetrieveResult {
             node_id: node.0.clone(),
