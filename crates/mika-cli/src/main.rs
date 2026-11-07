@@ -6,7 +6,9 @@ use mika_node::{AppState, SharedState};
 use mika_storage::blob::BlobID;
 use mika_storage::epoch::current_epoch;
 use mika_storage::erasure::ErasureParams;
-use mika_storage::{Blob, MikaClient, NodeAddr, StorageClient};
+use mika_storage::kanari_integration::KanariStorage;
+use mika_storage::onchain::BlobAnchor;
+use mika_storage::{Blob, MikaClient, NodeAddr, StorageClient, StoragePayment};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,6 +80,21 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         node_addr: String,
     },
+    /// Anchor a blob's metadata on-chain via kanari-sdk
+    Anchor {
+        /// Blob ID (hex-encoded)
+        blob_id: String,
+        /// Owner address (hex)
+        owner: String,
+        /// Commitment hash (hex)
+        commitment: String,
+        /// Keystore password for decrypting the signing key
+        #[arg(long)]
+        password: String,
+        /// Storage fee paid (in mist)
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+    },
 }
 
 #[tokio::main]
@@ -85,6 +102,52 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Anchor {
+            blob_id,
+            owner,
+            commitment,
+            password,
+            fee,
+        } => {
+            let blob_id = BlobID::try_from(blob_id.as_str())?;
+            let owner_addr = kanari_types::address::Address::from_hex_literal(&owner)
+                .with_context(|| format!("invalid owner address: {}", owner))?;
+            let commitment_bytes: [u8; 32] = hex::decode(&commitment)
+                .with_context(|| "commitment must be 64 hex chars (32 bytes)")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("commitment must be exactly 32 bytes"))?;
+
+            // Load keypair from kanari config via kanari-common
+            let storage = KanariStorage::from_config(&password, "cli-node")?;
+            let anchor = BlobAnchor {
+                blob_id,
+                owner: owner_addr,
+                commitment: commitment_bytes,
+                epoch: current_epoch(),
+                fee_paid: fee,
+            };
+
+            // Try to anchor (will fail with "not yet implemented" message,
+            // but demonstrates the integration path)
+            match storage.anchor_blob(&anchor).await {
+                Ok(()) => {
+                    println!("Blob anchored on-chain");
+                    println!("  Blob ID: {}", blob_id);
+                    println!("  Owner: {}", owner);
+                    println!("  Commitment: {}", commitment);
+                    println!("  Fee paid: {} mist", fee);
+                }
+                Err(e) => {
+                    println!("Anchor not yet implemented against BlockchainEngine");
+                    println!("  Blob ID: {}", blob_id);
+                    println!("  Owner: {}", owner);
+                    println!("  Commitment: {}", commitment);
+                    println!("  Fee paid: {} mist", fee);
+                    println!("  Error: {}", e);
+                }
+            }
+        }
+
         Commands::Upload {
             file,
             nodes,

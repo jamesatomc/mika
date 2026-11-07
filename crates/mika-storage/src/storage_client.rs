@@ -173,6 +173,8 @@ impl MikaClient {
                 epoch: current_epoch(),
                 sliver_hash: kanari_crypto::hash_data_blake3_array(shard),
                 signature: vec![], // placeholder; real client signs with its key
+                public_key: String::new(),
+                curve_type: "K256".to_string(),
             });
         }
 

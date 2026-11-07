@@ -20,8 +20,14 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 kanari-crypto = { workspace = true }
+kanari-types = { workspace = true }
+kanari-core = { workspace = true, optional = true }
 axum = { workspace = true }
 
 [[bin]]
 name = "mika-cli"
 path = "src/main.rs"
+
+[features]
+default = ["onchain"]
+onchain = ["kanari-core", "mika-storage/onchain"]

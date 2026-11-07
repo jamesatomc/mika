@@ -20,8 +20,10 @@ thiserror = { workspace = true }
 bcs = { workspace = true }
 kanari-types = { workspace = true }
 kanari-crypto = { workspace = true }
+kanari-core = { workspace = true, optional = true }
+kanari-common = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
-async-trait = "0.1.92"
+async-trait = { workspace = true }
 fjall = { workspace = true }
 tempfile = { workspace = true }
 
@@ -31,3 +33,4 @@ rand = { workspace = true }
 
 [features]
 default = []
+onchain = ["kanari-core", "kanari-common"]

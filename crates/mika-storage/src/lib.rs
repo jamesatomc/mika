@@ -24,6 +24,9 @@ pub mod onchain;
 pub mod sliver;
 pub mod storage_client;
 
+#[cfg(feature = "onchain")]
+pub mod kanari_integration;
+
 pub use blob::{Blob, BlobID};
 pub use certificate::{ReadCertificate, WriteCertificate, WriteCertificateQuorum};
 pub use epoch::{Epoch, Lease, current_epoch};
@@ -32,3 +35,6 @@ pub use error::{MikaStorageError, Result};
 pub use onchain::{BlobAnchor as StorageAnchor, StorageFeePayment, StoragePayment};
 pub use sliver::Sliver;
 pub use storage_client::{MikaClient, NodeAddr, RetrieveResult, StorageClient, StoreResult};
+
+#[cfg(feature = "onchain")]
+pub use kanari_integration::KanariStorage;
