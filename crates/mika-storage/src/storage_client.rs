@@ -1,8 +1,9 @@
 //! Client for uploading and downloading blobs to/from Mika storage nodes.
 //!
 //! The client erasure-codes a blob into slivers, distributes them to storage
-//! nodes, collects write certificates, and can later reassemble a blob from the
-//! slivers.
+//! nodes, collects write certificates, and can later reassemble a blob from
+//! the slivers. Slivers are persisted in an on-disk fjall key-value store so
+//! uploads survive across separate CLI invocations.
 
 use crate::blob::{Blob, BlobID};
 use crate::certificate::{WriteCertificate, WriteCertificateQuorum};
@@ -11,7 +12,7 @@ use crate::erasure::{ErasureParams, decode, encode, rejoin_shards, split_into_sh
 use crate::error::{MikaStorageError, Result};
 use crate::sliver::Sliver;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use fjall::{Database, Keyspace};
 use std::path::PathBuf;
 
 /// Address of a storage node (host:port).
@@ -62,23 +63,35 @@ pub trait StorageClient: Send + Sync {
     -> Result<bool>;
 }
 
-/// Default in-memory / HTTP-backed client implementation.
-#[derive(Debug, Clone)]
+/// Default fjall-backed client implementation.
+///
+/// Slivers are persisted in an on-disk fjall LSM-tree keyed by
+/// `blob_id (32 bytes) || shard_index (4 bytes LE)`.
+#[derive(Clone)]
+#[allow(dead_code)]
 pub struct MikaClient {
     pub nodes: Vec<NodeAddr>,
-    /// Simulated remote storage: node_id -> (blob_id, shard_index) -> sliver bytes.
-    /// In production this would be real HTTP calls to each node.
-    store: std::sync::Arc<tokio::sync::RwLock<HashMap<(String, u32), Sliver>>>,
-    /// Optional on-disk path for the store so slivers survive across processes.
-    store_path: Option<PathBuf>,
+    db: Database,
+    keyspace: Keyspace,
 }
 
 impl MikaClient {
+    /// Create a client with a temporary on-disk fjall store.
+    #[allow(deprecated)]
     pub fn new(nodes: Vec<NodeAddr>) -> Self {
+        let dir = tempfile::tempdir()
+            .expect("failed to create temp dir")
+            .into_path();
+        let db = Database::builder(&dir)
+            .open()
+            .expect("failed to open fjall database");
+        let keyspace = db
+            .keyspace("slivers", Default::default)
+            .expect("failed to open keyspace");
         Self {
             nodes,
-            store: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            store_path: None,
+            db,
+            keyspace,
         }
     }
 
@@ -86,37 +99,26 @@ impl MikaClient {
     /// data so uploads and lookups survive across separate CLI invocations.
     pub fn with_store_path(nodes: Vec<NodeAddr>, path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let store = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|content| {
-                    serde_json::from_str::<Vec<((String, u32), Sliver)>>(&content).ok()
-                })
-                .map(|entries| entries.into_iter().collect::<HashMap<_, _>>())
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
+        let _ = std::fs::create_dir_all(&path);
+        let db = Database::builder(&path)
+            .open()
+            .expect("failed to open fjall database");
+        let keyspace = db
+            .keyspace("slivers", Default::default)
+            .expect("failed to open keyspace");
         Self {
             nodes,
-            store: std::sync::Arc::new(tokio::sync::RwLock::new(store)),
-            store_path: Some(path),
+            db,
+            keyspace,
         }
     }
 
-    async fn save_store(&self) {
-        let Some(path) = &self.store_path else { return };
-        let entries = {
-            let store = self.store.read().await;
-            store
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<Vec<((String, u32), Sliver)>>()
-        };
-        let Ok(content) = serde_json::to_string_pretty(&entries) else {
-            return;
-        };
-        let _ = std::fs::write(path, content);
+    /// Encode a sliver key: blob_id (32 bytes) || shard_index (4 bytes LE).
+    fn sliver_key(node_id: &str, shard_index: u32) -> Vec<u8> {
+        let mut key = node_id.as_bytes().to_vec();
+        key.push(0xFF); // separator
+        key.extend_from_slice(&shard_index.to_le_bytes());
+        key
     }
 
     /// Erasure-code a blob and distribute its slivers across the configured nodes.
@@ -148,7 +150,6 @@ impl MikaClient {
             blob.data.len() as u64,
         );
 
-        let mut store = self.store.write().await;
         for (i, shard) in encoded.iter().enumerate() {
             let node = &self.nodes[i % self.nodes.len()];
             let sliver = Sliver::new(
@@ -160,7 +161,11 @@ impl MikaClient {
                 blob.data.len() as u64,
                 shard.clone(),
             );
-            store.insert((node.0.clone(), i as u32), sliver);
+            let key = Self::sliver_key(&node.0, i as u32);
+            let bytes = sliver.to_bytes()?;
+            self.keyspace
+                .insert(key, bytes)
+                .map_err(|e| MikaStorageError::Io(e.to_string()))?;
             quorum.add(WriteCertificate {
                 blob_id: blob.id,
                 shard_index: i as u32,
@@ -170,8 +175,6 @@ impl MikaClient {
                 signature: vec![], // placeholder; real client signs with its key
             });
         }
-        drop(store);
-        self.save_store().await;
 
         let lease = Lease::new(blob.id, 86400, fee);
         Ok((quorum, lease))
@@ -182,22 +185,28 @@ impl MikaClient {
         let n = params.total_shards();
         let mut present: Vec<Option<Vec<u8>>> = vec![None; n];
         let mut original_len: Option<usize> = None;
-        let store = self.store.read().await;
+
         for (i, present_slot) in present.iter_mut().enumerate().take(n) {
             // Try each node until we find the shard.
             for node in &self.nodes {
-                if let Some(sliver) = store.get(&(node.0.clone(), i as u32))
-                    && sliver.blob_id == *blob_id
+                let key = Self::sliver_key(&node.0, i as u32);
+                if let Some(bytes) = self
+                    .keyspace
+                    .get(key)
+                    .map_err(|e| MikaStorageError::Io(e.to_string()))?
                 {
-                    *present_slot = Some(sliver.data.clone());
-                    if original_len.is_none() {
-                        original_len = Some(sliver.original_len as usize);
+                    let sliver = Sliver::from_bytes(&bytes)
+                        .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
+                    if sliver.blob_id == *blob_id {
+                        *present_slot = Some(sliver.data);
+                        if original_len.is_none() {
+                            original_len = Some(sliver.original_len as usize);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
-        drop(store);
 
         let data_shards = decode(&present, params)?;
         let original_len =
@@ -210,11 +219,11 @@ impl MikaClient {
 #[async_trait::async_trait]
 impl StorageClient for MikaClient {
     async fn store_sliver(&self, node: &NodeAddr, sliver: &Sliver) -> Result<StoreResult> {
-        {
-            let mut store = self.store.write().await;
-            store.insert((node.0.clone(), sliver.shard_index), sliver.clone());
-        }
-        self.save_store().await;
+        let key = Self::sliver_key(&node.0, sliver.shard_index);
+        let bytes = sliver.to_bytes()?;
+        self.keyspace
+            .insert(key, bytes)
+            .map_err(|e| MikaStorageError::Io(e.to_string()))?;
         Ok(StoreResult {
             node_id: node.0.clone(),
             shard_index: sliver.shard_index,
@@ -228,15 +237,18 @@ impl StorageClient for MikaClient {
         blob_id: &BlobID,
         shard_index: u32,
     ) -> Result<RetrieveResult> {
-        let store = self.store.read().await;
-        let sliver = store
-            .get(&(node.0.clone(), shard_index))
-            .filter(|&s| s.blob_id == *blob_id)
+        let key = Self::sliver_key(&node.0, shard_index);
+        let bytes = self
+            .keyspace
+            .get(key)
+            .map_err(|e| MikaStorageError::Io(e.to_string()))?
             .ok_or_else(|| MikaStorageError::BlobNotFound(blob_id.to_hex()))?;
+        let sliver = Sliver::from_bytes(&bytes)
+            .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
         Ok(RetrieveResult {
             node_id: node.0.clone(),
             shard_index,
-            data: sliver.data.clone(),
+            data: sliver.data,
         })
     }
 
@@ -246,11 +258,19 @@ impl StorageClient for MikaClient {
         blob_id: &BlobID,
         shard_index: u32,
     ) -> Result<bool> {
-        let store = self.store.read().await;
-        Ok(store
-            .get(&(node.0.clone(), shard_index))
-            .map(|s| s.blob_id == *blob_id)
-            .unwrap_or(false))
+        let key = Self::sliver_key(&node.0, shard_index);
+        match self
+            .keyspace
+            .get(key)
+            .map_err(|e| MikaStorageError::Io(e.to_string()))?
+        {
+            Some(bytes) => {
+                let sliver = Sliver::from_bytes(&bytes)
+                    .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
+                Ok(sliver.blob_id == *blob_id)
+            }
+            None => Ok(false),
+        }
     }
 }
 

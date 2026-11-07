@@ -21,6 +21,7 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+fjall = { workspace = true }
 kanari-crypto = { workspace = true }
 
 [dev-dependencies]

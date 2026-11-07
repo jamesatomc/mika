@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
                 nodes.into_iter().map(NodeAddr::new).collect()
             };
 
-            let client = MikaClient::with_store_path(node_addrs.clone(), "./mika-store.json");
+            let client = MikaClient::with_store_path(node_addrs.clone(), "./mika-store");
             let (quorum, lease) = client.put_blob(&blob, &params, fee).await?;
 
             println!("Upload complete");
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
                 nodes.into_iter().map(NodeAddr::new).collect()
             };
 
-            let client = MikaClient::with_store_path(node_addrs, "./mika-store.json");
+            let client = MikaClient::with_store_path(node_addrs, "./mika-store");
             let fetched = client.get_blob(&blob_id, &params).await?;
 
             tokio::fs::write(&output, &fetched.data)
@@ -171,10 +171,8 @@ async fn main() -> Result<()> {
             node_addr,
         } => {
             let blob_id = BlobID::try_from(blob_id.as_str())?;
-            let client = MikaClient::with_store_path(
-                vec![NodeAddr::new(node_addr.clone())],
-                "./mika-store.json",
-            );
+            let client =
+                MikaClient::with_store_path(vec![NodeAddr::new(node_addr.clone())], "./mika-store");
 
             // Retrieve the sliver and verify its proof
             let result = client

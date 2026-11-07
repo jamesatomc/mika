@@ -2,6 +2,16 @@
 
 Mika is a minimal decentralized storage prototype. A blob is split into `k` data shards plus `m` parity shards (systematic Reed–Solomon over GF(2^8)), distributed across storage nodes, and can be reconstructed from any `k` surviving shards.
 
+## Storage Engine: Fjall
+
+Mika uses [fjall](https://fjall-rs.github.io/) (v3), an embeddable LSM-tree key-value store written in Rust, for on-disk sliver persistence. Fjall replaces the previous JSON file-based approach and provides:
+
+- **ACID transactions** with crash safety
+- **LSM-tree** storage for high write throughput
+- **Key-value separation** for efficient large value storage
+- **Automatic compaction** and garbage collection
+- **Concurrent reads** with snapshot isolation
+
 ## Build
 
 ```powershell
@@ -69,7 +79,7 @@ cargo run -p mika-cli -- proof <blob_id> <shard_index> --node-addr 127.0.0.1:808
 ```
 
 - `<blob_id>` — hex-encoded blob ID
-- `<shard_index>` — shard index (positional, not a flag)
+- `<shard_index>` — shard index (positional argument, not a flag)
 - `--node-addr` — node address (default `127.0.0.1:8080`)
 
 Example output:
@@ -88,24 +98,29 @@ Example output:
 ## End-to-End Example
 
 ```powershell
-# 1. Upload
+# 1. Upload (creates ./mika-store/ fjall database)
 cargo run -p mika-cli -- upload --file myfile.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2 --fee 1000
 
-# 2. Proof a shard (uses the stored sliver)
+# 2. Proof a shard (reads from ./mika-store/)
 cargo run -p mika-cli -- proof <BLOB_ID> 0 --node-addr 127.0.0.1:8080
 
-# 3. Download and verify
+# 3. Download and verify (reads from ./mika-store/)
 cargo run -p mika-cli -- download <BLOB_ID> --output recovered.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2
 fc myfile.txt recovered.txt
 ```
 
-## How It Works
+## Persistence
 
-1. **Split** — `split_into_shards` divides the blob into `k` equal-size data shards, zero-padding the last shard if needed.
-2. **Encode** — `encode` computes `m` parity shards using GF(256) Reed–Solomon coefficients `α^((p+1)·d)`. The first `k` output shards are the data; the rest are parity.
-3. **Distribute** — `put_blob` stores each encoded shard on a node (round-robin) and collects write certificates.
-4. **Retrieve** — `get_blob` gathers at least `k` available shards, builds the `k×k` system matrix, solves it via Gaussian elimination over GF(256), and rejoins the data shards, trimming padding to the original length.
-5. **Persist** — `MikaClient::with_store_path` saves the in-memory sliver store to `./mika-store.json` so uploads survive across separate CLI invocations (upload in one process, proof/download in another).
+Slivers are stored in a fjall database at `./mika-store/` (relative to the working directory). The directory is created automatically on first upload. Because fjall is an embedded KV store, data persists across separate CLI invocations — you can upload in one process and then proof/download in another.
+
+## Storage Layout
+
+Each sliver is stored as a key-value pair in fjall:
+
+- **Key**: `blob_id (32 bytes) || shard_index (4 bytes little-endian)` = 36 bytes
+- **Value**: bcs-serialized `Sliver` struct
+
+Prefix scans on `blob_id` bytes are used to list all shard indices for a given blob.
 
 ## Requirements
 
@@ -115,5 +130,6 @@ fc myfile.txt recovered.txt
 
 ## Known Limitations
 
-- The demo `MikaClient` is an in-memory HTTP-simulated store; real node-to-node HTTP is not yet implemented.
-- Cross-process persistence relies on `./mika-store.json` written to the current working directory.
+- The demo `MikaClient` uses fjall for local persistence; real node-to-node HTTP replication is not yet implemented.
+- The fjall database directory (`./mika-store/`) is not automatically cleaned up between runs.
+- Cross-process persistence relies on the shared `./mika-store/` directory.

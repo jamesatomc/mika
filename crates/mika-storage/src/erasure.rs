@@ -22,7 +22,7 @@ impl GFTables {
             exp[i as usize] = x;
             log[x as usize] = i as u8;
             let high_bit_set = x & 0x80 != 0;
-            x = ((x << 1));
+            x <<= 1;
             if high_bit_set {
                 x ^= 0x1d; // GF(2^8) reduction with polynomial 0x11d (generator 2)
             }
