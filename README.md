@@ -18,53 +18,23 @@ Mika uses [fjall](https://fjall-rs.github.io/) (v3), an embeddable LSM-tree key-
 cargo build --release
 ```
 
-The binary is `target/release/mika-cli`.
+Binaries:
 
-## CLI Usage
+- `target/release/mika-cli` — CLI tool (upload, download, proof, node)
+- `target/release/mika-node` — storage node server
 
-```powershell
-cargo run -p mika-cli -- <command> [options]
-```
-
-### 1. Upload a file
+## Running the Storage Node
 
 ```powershell
-cargo run -p mika-cli -- upload --file myfile.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2 --fee 1000
+cargo run -p mika-node -- --node-id node-1 --data-dir ./mika-data --listen-addr 127.0.0.1:8080
 ```
 
-Options:
+The node serves both APIs on the same port:
 
-- `--file` — path to the file to upload (required)
-- `--nodes` — storage node address(es), comma-separated (default `127.0.0.1:8080`)
-- `--data-shards` — number of data shards `k` (default `3`)
-- `--parity-shards` — number of parity shards `m` (default `2`)
-- `--fee` — storage fee in mist (default `1000`)
-
-Example output:
-
-```
-Upload complete
-  Blob ID: 27b8f6f7...
-  Size: 32 bytes
-  Shards: 3 data + 2 parity
-  Nodes: 1
-  Certificates collected: 5
-```
-
-### 2. Download a file
-
-```powershell
-cargo run -p mika-cli -- download <blob_id> --output out.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2
-```
-
-- `<blob_id>` — hex-encoded blob ID returned by upload
-- `--output` — destination file path
-
-### 3. Start a storage node
-
-```powershell
-cargo run -p mika-cli -- node --node-id node-1 --data-dir ./mika-data --listen-addr 127.0.0.1:8080
-```
+| API            | Endpoints                                                                                                                                                          |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Sliver API** | `GET /health`, `PUT/GET /slivers/{blob_id}/{shard_index}`, `GET /proofs/{blob_id}/{shard_index}`                                                                   |
+| **Web API**    | `GET /`, `POST /api/v1/upload`, `GET /api/v1/download/{blob_id}`, `GET /api/v1/proof/{blob_id}/{shard_index}`, `GET /api/v1/blobs/{blob_id}`, `GET /api/v1/health` |
 
 Options:
 
@@ -72,46 +42,96 @@ Options:
 - `--data-dir` — on-disk data directory (default `./mika-data`)
 - `--listen-addr` — listen address (default `127.0.0.1:8080`)
 
-### 4. Get a storage proof for a sliver
+## Web API (Browser-Ready)
+
+The web API includes CORS headers so browsers can call it directly. A single-page HTML frontend is served at `GET /`.
+
+### 1. Upload a File
+
+```powershell
+curl -X POST -F "file=@myfile.txt" http://127.0.0.1:8080/api/v1/upload
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "blob_id": "27b8f6f78d134903727959b38de290371b6793a760055d669e11802b2bb896f7",
+  "filename": "myfile.txt",
+  "size": 32,
+  "shards": "3 data + 2 parity",
+  "nodes": 1
+}
+```
+
+### 2. Download a File
+
+```powershell
+curl http://127.0.0.1:8080/api/v1/download/27b8f6f7... > recovered.txt
+```
+
+### 3. Storage Proof
+
+```powershell
+curl http://127.0.0.1:8080/api/v1/proof/27b8f6f7.../0
+```
+
+Response:
+
+```json
+{
+  "blob_id": "27b8f6f7...",
+  "shard_index": 0,
+  "node_id": "node-1",
+  "epoch": 1794030586,
+  "sliver_digest": "7d8081c24869765dcb79490332667118681c3908ac719bee3a8dc54c5c4cb4fd",
+  "sliver_size": 11,
+  "original_len": 32,
+  "data_shards": 3,
+  "parity_shards": 2
+}
+```
+
+### 4. Blob Metadata
+
+```powershell
+curl http://127.0.0.1:8080/api/v1/blobs/27b8f6f7...
+```
+
+## CLI Usage
+
+```powershell
+cargo run -p mika-cli -- <command> [options]
+```
+
+### Upload
+
+```powershell
+cargo run -p mika-cli -- upload --file myfile.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2 --fee 1000
+```
+
+### Download
+
+```powershell
+cargo run -p mika-cli -- download <blob_id> --output out.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2
+```
+
+### Proof
 
 ```powershell
 cargo run -p mika-cli -- proof <blob_id> <shard_index> --node-addr 127.0.0.1:8080
 ```
 
-- `<blob_id>` — hex-encoded blob ID
-- `<shard_index>` — shard index (positional argument, not a flag)
-- `--node-addr` — node address (default `127.0.0.1:8080`)
-
-Example output:
-
-```json
-{
-  "blob_id": "...",
-  "epoch": 1793987101,
-  "node_id": "127.0.0.1:8080",
-  "shard_index": 0,
-  "sliver_digest": "7d8081c2...",
-  "sliver_size": 11
-}
-```
-
-## End-to-End Example
+### Run Node
 
 ```powershell
-# 1. Upload (creates ./mika-store/ fjall database)
-cargo run -p mika-cli -- upload --file myfile.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2 --fee 1000
-
-# 2. Proof a shard (reads from ./mika-store/)
-cargo run -p mika-cli -- proof <BLOB_ID> 0 --node-addr 127.0.0.1:8080
-
-# 3. Download and verify (reads from ./mika-store/)
-cargo run -p mika-cli -- download <BLOB_ID> --output recovered.txt --nodes 127.0.0.1:8080 --data-shards 3 --parity-shards 2
-fc myfile.txt recovered.txt
+cargo run -p mika-cli -- node --node-id node-1 --data-dir ./mika-data --listen-addr 127.0.0.1:8080
 ```
 
 ## Persistence
 
-Slivers are stored in a fjall database at `./mika-store/` (relative to the working directory). The directory is created automatically on first upload. Because fjall is an embedded KV store, data persists across separate CLI invocations — you can upload in one process and then proof/download in another.
+Slivers are stored in a fjall database at `./mika-data/` (or `--data-dir`). Data persists across separate CLI invocations and server restarts.
 
 ## Storage Layout
 
@@ -120,7 +140,7 @@ Each sliver is stored as a key-value pair in fjall:
 - **Key**: `blob_id (32 bytes) || shard_index (4 bytes little-endian)` = 36 bytes
 - **Value**: bcs-serialized `Sliver` struct
 
-Prefix scans on `blob_id` bytes are used to list all shard indices for a given blob.
+Prefix scans on `blob_id` bytes list all shard indices for a blob.
 
 ## Requirements
 
@@ -130,6 +150,5 @@ Prefix scans on `blob_id` bytes are used to list all shard indices for a given b
 
 ## Known Limitations
 
-- The demo `MikaClient` uses fjall for local persistence; real node-to-node HTTP replication is not yet implemented.
-- The fjall database directory (`./mika-store/`) is not automatically cleaned up between runs.
-- Cross-process persistence relies on the shared `./mika-store/` directory.
+- Real node-to-node HTTP replication is not yet implemented (single node stores all shards locally).
+- The web API uses fixed erasure parameters (3 data + 2 parity shards).

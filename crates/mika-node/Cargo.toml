@@ -12,12 +12,13 @@ repository.workspace = true
 description.workspace = true
 
 [dependencies]
+clap = { workspace = true, features = ["derive"] }
 mika-storage = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-axum = { workspace = true }
-tower-http = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
+tower-http = { workspace = true, features = ["cors"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

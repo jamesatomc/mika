@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hex::encode as hex_encode;
-use mika_node::NodeState;
 use mika_node::store::SliverStore;
+use mika_node::{AppState, SharedState};
 use mika_storage::blob::BlobID;
 use mika_storage::epoch::current_epoch;
 use mika_storage::erasure::ErasureParams;
@@ -153,8 +153,9 @@ async fn main() -> Result<()> {
             listen_addr,
         } => {
             let store = SliverStore::new(data_dir.clone())?;
-            let state = Arc::new(NodeState::new(node_id.clone(), store, current_epoch()));
-            let app = mika_node::server::router(state.clone());
+            let state: SharedState =
+                Arc::new(AppState::new(node_id.clone(), store, current_epoch()));
+            let app = mika_node::server::routes().with_state(state.clone());
             let addr: std::net::SocketAddr = listen_addr.parse()?;
 
             println!("Starting Mika node {}", node_id);

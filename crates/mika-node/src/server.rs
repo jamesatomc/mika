@@ -1,14 +1,14 @@
 //! HTTP API for a Mika storage node.
 //!
 //! Endpoints:
+//!   GET   /health                            liveness check
 //!   PUT   /slivers/{blob_id}/{shard_index}   store a sliver
 //!   GET   /slivers/{blob_id}/{shard_index}   retrieve a sliver
 //!   GET   /proofs/{blob_id}/{shard_index}    get a storage proof
-//!   GET   /health                            liveness check
 
-use axum::body::Bytes;
 use axum::{
     Router,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     response::Json,
@@ -17,35 +17,15 @@ use axum::{
 use mika_storage::blob::BlobID;
 use mika_storage::sliver::Sliver;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tracing::info;
 
+use crate::SharedState;
 use crate::proof::StorageProof;
-use crate::store::SliverStore;
-
-pub type AppState = Arc<NodeState>;
-
-#[derive(Clone)]
-pub struct NodeState {
-    pub node_id: String,
-    pub store: SliverStore,
-    pub epoch: u64,
-}
-
-impl NodeState {
-    pub fn new(node_id: String, store: SliverStore, epoch: u64) -> Self {
-        Self {
-            node_id,
-            store,
-            epoch,
-        }
-    }
-}
 
 #[derive(Deserialize)]
 pub struct SliverPathParams {
-    blob_id: String,
-    shard_index: u32,
+    pub blob_id: String,
+    pub shard_index: u32,
 }
 
 #[derive(Serialize)]
@@ -62,8 +42,8 @@ pub struct ProofResponse {
 }
 
 /// `PUT /slivers/{blob_id}/{shard_index}` — store a sliver on this node.
-async fn put_sliver(
-    State(state): State<AppState>,
+pub async fn put_sliver(
+    State(state): State<SharedState>,
     Path(params): Path<SliverPathParams>,
     body: Bytes,
 ) -> Result<Json<PutResponse>, StatusCode> {
@@ -87,8 +67,8 @@ async fn put_sliver(
 }
 
 /// `GET /slivers/{blob_id}/{shard_index}` — retrieve a sliver.
-async fn get_sliver(
-    State(state): State<AppState>,
+pub async fn get_sliver(
+    State(state): State<SharedState>,
     Path(params): Path<SliverPathParams>,
 ) -> Result<axum::body::Bytes, StatusCode> {
     let blob_id = BlobID::try_from(params.blob_id.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -106,8 +86,8 @@ async fn get_sliver(
 }
 
 /// `GET /proofs/{blob_id}/{shard_index}` — storage proof.
-async fn get_proof(
-    State(state): State<AppState>,
+pub async fn get_proof(
+    State(state): State<SharedState>,
     Path(params): Path<SliverPathParams>,
 ) -> Result<Json<ProofResponse>, StatusCode> {
     let blob_id = BlobID::try_from(params.blob_id.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -128,15 +108,12 @@ async fn get_proof(
 }
 
 /// `GET /health`
-async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "node_id": state.node_id,
-        "epoch": state.epoch,
-    }))
+pub async fn health(State(_state): State<SharedState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
 }
 
-pub fn router(state: AppState) -> Router {
+/// Build the sliver storage API routes.
+pub fn routes() -> Router<SharedState> {
     Router::new()
         .route("/health", get(health))
         .route(
@@ -144,7 +121,6 @@ pub fn router(state: AppState) -> Router {
             put(put_sliver).get(get_sliver),
         )
         .route("/proofs/{blob_id}/{shard_index}", get(get_proof))
-        .with_state(state)
 }
 
 #[cfg(test)]
@@ -152,14 +128,14 @@ mod tests {
     use super::*;
     use mika_storage::erasure::{ErasureParams, encode};
     use mika_storage::sliver::Sliver;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[tokio::test]
     async fn node_api_round_trip() {
         let dir = tempdir().unwrap();
-        let store = SliverStore::new(dir.path().to_path_buf()).unwrap();
-        let state = Arc::new(NodeState::new("node-1".into(), store, 1));
-        let _app = router(state.clone());
+        let store = crate::store::SliverStore::new(dir.path().to_path_buf()).unwrap();
+        let state = Arc::new(crate::AppState::new("node-1".into(), store, 1));
 
         let blob_id = BlobID::from_content(b"api test");
         let params = ErasureParams::new(3, 2).unwrap();
