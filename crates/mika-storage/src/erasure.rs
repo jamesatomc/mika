@@ -8,12 +8,12 @@
 use crate::error::{MikaStorageError, Result};
 
 /// Pre-computed GF(256) log and exp tables.
-struct GFTables {
+struct GfTables {
     exp: [u8; 512],
     log: [u8; 256],
 }
 
-impl GFTables {
+impl GfTables {
     fn new() -> Self {
         let mut exp = [0u8; 512];
         let mut log = [0u8; 256];
@@ -35,10 +35,10 @@ impl GFTables {
     }
 }
 
-static TABLES: std::sync::OnceLock<GFTables> = std::sync::OnceLock::new();
+static TABLES: std::sync::OnceLock<GfTables> = std::sync::OnceLock::new();
 
-fn tables() -> &'static GFTables {
-    TABLES.get_or_init(GFTables::new)
+fn tables() -> &'static GfTables {
+    TABLES.get_or_init(GfTables::new)
 }
 
 fn gf_mul_raw(a: u8, b: u8) -> u8 {

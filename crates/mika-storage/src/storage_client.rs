@@ -263,16 +263,15 @@ impl MikaClient {
             // local fjall cache second).
             for node in &self.nodes {
                 #[cfg(feature = "onchain")]
-                if let Some(bytes) = self.http_get(node, blob_id, i as u32).await {
-                    if let Ok(sliver) = Sliver::from_bytes(&bytes) {
-                        if sliver.blob_id == *blob_id {
-                            *present_slot = Some(sliver.data.clone());
-                            if original_len.is_none() {
-                                original_len = Some(sliver.original_len as usize);
-                            }
-                            break;
-                        }
+                if let Some(bytes) = self.http_get(node, blob_id, i as u32).await
+                    && let Ok(sliver) = Sliver::from_bytes(&bytes)
+                    && sliver.blob_id == *blob_id
+                {
+                    *present_slot = Some(sliver.data.clone());
+                    if original_len.is_none() {
+                        original_len = Some(sliver.original_len as usize);
                     }
+                    break;
                 }
                 let key = Self::sliver_key(&node.0, i as u32);
                 if let Some(bytes) = self

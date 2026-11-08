@@ -57,6 +57,8 @@ pub async fn put_sliver(
         .put(&sliver)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Control plane: announce the new shard over gossipsub.
+    state.announce_sliver(&blob_id, sliver.shard_index);
     info!(node = %state.node_id, blob = %blob_id, shard = sliver.shard_index, "stored sliver");
     Ok(Json(PutResponse {
         ok: true,

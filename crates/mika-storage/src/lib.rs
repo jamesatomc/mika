@@ -14,7 +14,7 @@
 //!    via `changeset.transfer` / `execute_backend_native_transfer`.
 //! 2. **Off-chain (Mika)**: erasure-coded blobs on storage nodes; ownership
 //!    proven by on-chain anchor + write-certificate quorum.
- 
+
 pub mod blob;
 pub mod certificate;
 pub mod commitment;

@@ -13,7 +13,7 @@ description.workspace = true
 
 [dependencies]
 mika-storage = { workspace = true }
-mika-node = { workspace = true }
+mika-server = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
@@ -23,6 +23,7 @@ kanari-crypto = { workspace = true }
 kanari-types = { workspace = true }
 kanari-core = { workspace = true, optional = true }
 axum = { workspace = true }
+libp2p-identity = { workspace = true }
 
 [[bin]]
 name = "mika-cli"

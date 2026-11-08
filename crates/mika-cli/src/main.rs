@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hex::encode as hex_encode;
-use mika_node::store::SliverStore;
-use mika_node::{AppState, SharedState};
+use mika_server::store::SliverStore;
+use mika_server::{AppState, SharedState};
 use mika_storage::blob::BlobID;
 use mika_storage::epoch::current_epoch;
 use mika_storage::erasure::ErasureParams;
@@ -78,6 +78,15 @@ enum Commands {
         /// Listen address (host:port)
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen_addr: String,
+        /// Disable P2P control plane (HTTP only)
+        #[arg(long, default_value_t = false)]
+        no_p2p: bool,
+        /// libp2p listen port (0 = random)
+        #[arg(long, default_value_t = 0)]
+        p2p_listen: u16,
+        /// Bootstrap multiaddr (repeatable)
+        #[arg(long)]
+        bootstrap: Vec<String>,
     },
     /// Get a storage proof for a sliver
     Proof {
@@ -128,10 +137,10 @@ async fn main() -> Result<()> {
             password,
             storage_object_id,
         } => {
-            let storage =
-                KanariStorage::from_config(&password, "cli-node")?.with_storage_object_id(storage_object_id);
+            let storage = KanariStorage::from_config(&password, "cli-node")?
+                .with_storage_object_id(storage_object_id);
             let hash = storage.buy_storage(amount).await?;
-            println!("Bought storage quota on-chain: {} (tx {})", amount, hash);
+            eprintln!("Bought storage quota on-chain: {} (tx {})", amount, hash);
         }
 
         Commands::Anchor {
@@ -163,19 +172,19 @@ async fn main() -> Result<()> {
             // but demonstrates the integration path)
             match storage.anchor_blob(&anchor).await {
                 Ok(()) => {
-                    println!("Blob anchored on-chain");
-                    println!("  Blob ID: {}", blob_id);
-                    println!("  Owner: {}", owner);
-                    println!("  Commitment: {}", commitment);
-                    println!("  Fee paid: {} mist", fee);
+                    eprintln!("Blob anchored on-chain");
+                    eprintln!("  Blob ID: {}", blob_id);
+                    eprintln!("  Owner: {}", owner);
+                    eprintln!("  Commitment: {}", commitment);
+                    eprintln!("  Fee paid: {} mist", fee);
                 }
                 Err(e) => {
-                    println!("Anchor not yet implemented against BlockchainEngine");
-                    println!("  Blob ID: {}", blob_id);
-                    println!("  Owner: {}", owner);
-                    println!("  Commitment: {}", commitment);
-                    println!("  Fee paid: {} mist", fee);
-                    println!("  Error: {}", e);
+                    eprintln!("Anchor not yet implemented against BlockchainEngine");
+                    eprintln!("  Blob ID: {}", blob_id);
+                    eprintln!("  Owner: {}", owner);
+                    eprintln!("  Commitment: {}", commitment);
+                    eprintln!("  Fee paid: {} mist", fee);
+                    eprintln!("  Error: {}", e);
                 }
             }
         }
@@ -233,44 +242,42 @@ async fn main() -> Result<()> {
             // (2/2): CERTIFY on-chain — anchor blob commitment with owner
             // (records `fee_paid = fee` on-chain at upload time — this is
             // the "pay on upload" step for Walrus-style certify).
-            if !no_anchor {
-                if let Some(kv) = kanari.as_ref() {
-                    // 2D commitment (Walrus Red-Stuff style): verifiable per-sliver,
-                    // not just the 1D blob hash.
-                    let commitment = mika_storage::commitment::blob_commitment(&blob.data, &params);
-                    let owner = kanari_types::address::Address::from_hex_literal(kv.address())
-                        .with_context(|| format!("invalid owner address: {}", kv.address()))?;
-                    let anchor = BlobAnchor {
-                        blob_id: blob.id,
-                        owner,
-                        commitment,
-                        epoch: current_epoch(),
-                        fee_paid: fee,
-                    };
-                    match kv.anchor_blob(&anchor).await {
-                        Ok(()) => {
-                            println!("Paid + certified on-chain: {} mist", fee);
-                            println!("  anchor_blob (certify) committed");
-                        }
-                        Err(e) => {
-                            // Idempotent on retry: an already-anchored blob aborts
-                            // on-chain (E_BLOB_ALREADY_ANCHORED) — treat as ok.
-                            // (RPC surfaces only hash+status, so this is a
-                            // warning either way; the blob stays retrievable.)
-                            eprintln!("Warning: anchor_blob after quorum failed: {e}");
-                        }
+            if !no_anchor && let Some(kv) = kanari.as_ref() {
+                // 2D commitment (Walrus Red-Stuff style): verifiable per-sliver,
+                // not just the 1D blob hash.
+                let commitment = mika_storage::commitment::blob_commitment(&blob.data, &params);
+                let owner = kanari_types::address::Address::from_hex_literal(kv.address())
+                    .with_context(|| format!("invalid owner address: {}", kv.address()))?;
+                let anchor = BlobAnchor {
+                    blob_id: blob.id,
+                    owner,
+                    commitment,
+                    epoch: current_epoch(),
+                    fee_paid: fee,
+                };
+                match kv.anchor_blob(&anchor).await {
+                    Ok(()) => {
+                        eprintln!("Paid + certified on-chain: {} mist", fee);
+                        eprintln!("  anchor_blob (certify) committed");
+                    }
+                    Err(e) => {
+                        // Idempotent on retry: an already-anchored blob aborts
+                        // on-chain (E_BLOB_ALREADY_ANCHORED) — treat as ok.
+                        // (RPC surfaces only hash+status, so this is a
+                        // warning either way; the blob stays retrievable.)
+                        eprintln!("Warning: anchor_blob after quorum failed: {e}");
                     }
                 }
             }
 
-            println!("Upload complete");
-            println!("  Blob ID: {}", blob.id);
-            println!("  Size: {} bytes", blob.data.len());
-            println!("  Shards: {} data + {} parity", data_shards, parity_shards);
-            println!("  Nodes: {}", node_addrs.len());
-            println!("  Certificates collected: {}", quorum.certificates.len());
-            println!("  Lease expires at epoch: {}", lease.expires_at);
-            println!("  Fee paid: {} mist", lease.fee_paid);
+            eprintln!("Upload complete");
+            eprintln!("  Blob ID: {}", blob.id);
+            eprintln!("  Size: {} bytes", blob.data.len());
+            eprintln!("  Shards: {} data + {} parity", data_shards, parity_shards);
+            eprintln!("  Nodes: {}", node_addrs.len());
+            eprintln!("  Certificates collected: {}", quorum.certificates.len());
+            eprintln!("  Lease expires at epoch: {}", lease.expires_at);
+            eprintln!("  Fee paid: {} mist", lease.fee_paid);
         }
 
         Commands::Download {
@@ -296,26 +303,51 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("writing file {:?}", output))?;
 
-            println!("Download complete");
-            println!("  Blob ID: {}", blob_id);
-            println!("  Output: {:?}", output);
-            println!("  Size: {} bytes", fetched.data.len());
+            eprintln!("Download complete");
+            eprintln!("  Blob ID: {}", blob_id);
+            eprintln!("  Output: {:?}", output);
+            eprintln!("  Size: {} bytes", fetched.data.len());
         }
 
         Commands::Node {
             node_id,
             data_dir,
             listen_addr,
+            no_p2p,
+            p2p_listen,
+            bootstrap,
         } => {
             let store = SliverStore::new(data_dir.clone())?;
             let state: SharedState =
                 Arc::new(AppState::new(node_id.clone(), store, current_epoch()));
-            let app = mika_node::server::routes().with_state(state.clone());
+            if !no_p2p {
+                use libp2p_identity::Keypair;
+                let keypair = Keypair::generate_ed25519();
+                let mut p2p = mika_server::p2p::MikaP2P::new(keypair, p2p_listen)?;
+                eprintln!("mika p2p: peer {}", p2p.peer_id);
+                p2p.dial_bootstrap(&bootstrap);
+                *state.p2p.lock().unwrap() = Some(p2p);
+                let p2p_state = state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        {
+                            let mut p2p = p2p_state.p2p.lock().unwrap().take();
+                            if let Some(mut p) = p2p.take() {
+                                p.poll_once_sync();
+                                *p2p_state.p2p.lock().unwrap() = Some(p);
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+            }
+            let app = mika_server::server::routes().with_state(state.clone());
             let addr: std::net::SocketAddr = listen_addr.parse()?;
 
-            println!("Starting Mika node {}", node_id);
-            println!("  Data dir: {:?}", data_dir);
-            println!("  Listening on: {}", addr);
+            eprintln!("Starting Mika node {}", node_id);
+            eprintln!("  Data dir: {:?}", data_dir);
+            eprintln!("  Listening on: {}", addr);
+            eprintln!("  P2P: {}", if no_p2p { "disabled" } else { "enabled" });
 
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app.into_make_service()).await?;
@@ -338,7 +370,7 @@ async fn main() -> Result<()> {
 
             let digest_arr = kanari_crypto::hash_data_blake3_array(&sliver);
 
-            println!(
+            eprintln!(
                 "{}",
                 json!({
                     "blob_id": blob_id.to_hex(),

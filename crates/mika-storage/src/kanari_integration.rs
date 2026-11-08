@@ -479,8 +479,7 @@ impl KanariStorage {
             .map_err(|e| MikaStorageError::OnChain(format!("bad storage id {storage_id}: {e}")))?;
         let args = vec![
             storage_addr.to_bytes().to_vec(),
-            bcs_to_bytes(&amount)
-                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            bcs_to_bytes(&amount).map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
         ];
         let object_inputs = vec![ObjectInput {
             object_ref: ObjectRef {
