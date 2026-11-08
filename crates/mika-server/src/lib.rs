@@ -11,6 +11,7 @@ pub mod store;
 pub mod web;
 
 use crate::store::SliverStore;
+use kanari_crypto::{CurveType, generate_keypair};
 use std::sync::{Arc, Mutex};
 
 /// Unified application state shared by both the sliver storage API and the
@@ -20,6 +21,11 @@ pub struct AppState {
     pub node_id: String,
     pub store: SliverStore,
     pub epoch: u64,
+    /// Node's signing key for write certificates (BFT quorum: each node signs
+    /// its own certificate when storing a sliver).
+    pub private_key: String,
+    pub public_key: String,
+    pub curve_type: CurveType,
     /// P2P control plane (gossipsub announcements). `None` in unit tests /
     /// `--no-p2p` mode; HTTP data plane works without it.
     pub p2p: Arc<Mutex<Option<crate::p2p::MikaP2P>>>,
@@ -27,10 +33,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(node_id: String, store: SliverStore, epoch: u64) -> Self {
+        let keypair = generate_keypair(CurveType::K256).expect("failed to generate node keypair");
         Self {
-            node_id,
+            node_id: node_id.clone(),
             store,
             epoch,
+            private_key: keypair.private_key.to_string(),
+            public_key: keypair.public_key,
+            curve_type: CurveType::K256,
             p2p: Arc::new(Mutex::new(None)),
         }
     }

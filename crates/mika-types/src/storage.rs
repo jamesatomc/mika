@@ -64,6 +64,24 @@ pub struct BlobAnchoredEvent {
     pub fee_paid: u64,
 }
 
+/// `BlobUpgradedEvent { old_blob_id: address, new_blob_id: address, version: u64, owner: address, fee_paid: u64 }`
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BlobUpgradedEvent {
+    pub old_blob_id: AccountAddress,
+    pub new_blob_id: AccountAddress,
+    pub version: u64,
+    pub owner: AccountAddress,
+    pub fee_paid: u64,
+}
+
+/// `BlobReclaimedEvent { blob_id: address, reclaimed_at: u64, quota_refund: u64 }`
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BlobReclaimedEvent {
+    pub blob_id: AccountAddress,
+    pub reclaimed_at: u64,
+    pub quota_refund: u64,
+}
+
 /// `StorageRentPaidEvent { blob_id: address, amount: u64, new_fee_paid: u64 }`
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StorageRentPaidEvent {
@@ -151,6 +169,54 @@ impl PayStorageRentRequest {
     }
 }
 
+/// Args for `reclaim_blob(storage_id: address, blob_id: address, now_epoch: u64, ctx: &mut TxContext)`
+/// (`ctx` is injected by the node — do not send.)
+#[derive(Debug, Clone)]
+pub struct ReclaimBlobRequest {
+    pub storage_id: Vec<u8>,
+    pub blob_id: Vec<u8>,
+    pub now_epoch: u64,
+}
+
+impl ReclaimBlobRequest {
+    pub fn encode_args(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(vec![
+            self.storage_id.clone(),
+            self.blob_id.clone(),
+            bcs::to_bytes(&self.now_epoch)?,
+        ])
+    }
+}
+
+/// Args for `upgrade_blob(storage_id: address, old_blob_id: address,
+/// new_blob_id: address, owner: address, commitment: vector<u8>,
+/// epoch: u64, fee_paid: u64, ctx: &mut TxContext)`
+/// (`ctx` is injected by the node — do not send.)
+#[derive(Debug, Clone)]
+pub struct UpgradeBlobRequest {
+    pub storage_id: Vec<u8>,
+    pub old_blob_id: Vec<u8>,
+    pub new_blob_id: Vec<u8>,
+    pub owner: Vec<u8>,
+    pub commitment: Vec<u8>,
+    pub epoch: u64,
+    pub fee_paid: u64,
+}
+
+impl UpgradeBlobRequest {
+    pub fn encode_args(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(vec![
+            self.storage_id.clone(),
+            self.old_blob_id.clone(),
+            self.new_blob_id.clone(),
+            self.owner.clone(),
+            bcs::to_bytes(&self.commitment)?,
+            bcs::to_bytes(&self.epoch)?,
+            bcs::to_bytes(&self.fee_paid)?,
+        ])
+    }
+}
+
 /// Args for `transfer_blob_ownership(storage_id: address, blob_id: address,
 /// from: address, to: address, rent_transfer_amount: u64)`
 #[derive(Debug, Clone)]
@@ -213,7 +279,9 @@ impl StorageModule {
             buy_storage: "buy_storage",
             anchor_blob: "anchor_blob",
             pay_storage_rent: "pay_storage_rent",
+            reclaim_blob: "reclaim_blob",
             transfer_blob_ownership: "transfer_blob_ownership",
+            upgrade_blob: "upgrade_blob",
             get_blob_anchor: "get_blob_anchor",
             is_blob_anchored: "is_blob_anchored",
         }
@@ -226,7 +294,9 @@ pub struct StorageFunctions {
     pub buy_storage: &'static str,
     pub anchor_blob: &'static str,
     pub pay_storage_rent: &'static str,
+    pub reclaim_blob: &'static str,
     pub transfer_blob_ownership: &'static str,
+    pub upgrade_blob: &'static str,
     pub get_blob_anchor: &'static str,
     pub is_blob_anchored: &'static str,
 }
@@ -258,6 +328,42 @@ mod tests {
         assert_eq!(args[0].len(), 32);
         // commitment is BCS Vec<u8> (length-prefixed)
         assert!(args[3].len() > 32);
+    }
+
+    #[test]
+    fn reclaim_args_encode_in_order() {
+        let req = ReclaimBlobRequest {
+            storage_id: vec![1u8; 32],
+            blob_id: vec![2u8; 32],
+            now_epoch: 1000,
+        };
+        let args = req.encode_args().unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0].len(), 32);
+        assert_eq!(args[1].len(), 32);
+        assert_eq!(args[2].len(), 8); // u64 BCS
+    }
+
+    #[test]
+    fn upgrade_args_encode_in_order() {
+        let req = UpgradeBlobRequest {
+            storage_id: vec![1u8; 32],
+            old_blob_id: vec![2u8; 32],
+            new_blob_id: vec![3u8; 32],
+            owner: vec![4u8; 32],
+            commitment: vec![9u8; 32],
+            epoch: 1000,
+            fee_paid: 5000,
+        };
+        let args = req.encode_args().unwrap();
+        assert_eq!(args.len(), 7);
+        assert_eq!(args[0].len(), 32);
+        assert_eq!(args[1].len(), 32);
+        assert_eq!(args[2].len(), 32);
+        assert_eq!(args[3].len(), 32);
+        assert_eq!(args[4].len(), 33); // commitment BCS Vec<u8> (length-prefixed)
+        assert_eq!(args[5].len(), 8); // epoch u64
+        assert_eq!(args[6].len(), 8); // fee_paid u64
     }
 
     #[test]

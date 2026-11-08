@@ -91,6 +91,7 @@ kanari-core = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.
 kanari-rpc-client = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
 kanari-rpc-api = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
 kanari-common = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
+smt = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
 
 [patch.crates-io]
 # libp2p-kad = { path = "third_party/patches/libp2p-kad-0.48.0" }

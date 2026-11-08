@@ -3,10 +3,10 @@
 //! Each node keeps the slivers it has accepted in an on-disk fjall key-value
 //! store (LSM-tree) and can produce storage proofs for audits.
 
+use fjall::{Database, Keyspace};
 use mika_types::blob::BlobID;
 use mika_types::error::{MikaStorageError, Result};
 use mika_types::sliver::Sliver;
-use fjall::{Database, Keyspace};
 use std::path::PathBuf;
 
 /// A Mika storage node's local database of slivers, backed by fjall.

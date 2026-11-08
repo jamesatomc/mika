@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hex::encode as hex_encode;
-use mika_server::store::SliverStore;
-use mika_server::{AppState, SharedState};
 use mika_core::KanariStorage;
 use mika_core::{ErasureParams, MikaClient, NodeAddr, StorageClient};
+use mika_server::store::SliverStore;
+use mika_server::{AppState, SharedState};
 use mika_types::blob::BlobID;
 use mika_types::epoch::current_epoch;
 use mika_types::onchain::BlobAnchor;
@@ -125,6 +125,40 @@ enum Commands {
         #[arg(long)]
         storage_object_id: String,
     },
+    /// Reclaim an expired blob's anchor on-chain (refunds quota to Storage)
+    Reclaim {
+        /// Blob ID (hex-encoded) to reclaim
+        blob_id: String,
+        /// Storage object ID on-chain
+        #[arg(long)]
+        storage_object_id: String,
+        /// Keystore password for decrypting the signing key
+        #[arg(long)]
+        password: String,
+        /// Epoch timestamp (seconds) to check expiry against (defaults to now)
+        #[arg(long)]
+        now_epoch: Option<u64>,
+    },
+    /// Upgrade a blob to a new version (new content = new blob_id)
+    Upgrade {
+        /// Old blob ID (hex-encoded) to upgrade from
+        old_blob_id: String,
+        /// New blob ID (hex-encoded) to upgrade to
+        new_blob_id: String,
+        /// Owner address (hex)
+        owner: String,
+        /// Commitment hash (hex)
+        commitment: String,
+        /// Keystore password for decrypting the signing key
+        #[arg(long)]
+        password: String,
+        /// Storage object ID on-chain
+        #[arg(long)]
+        storage_object_id: String,
+        /// Storage fee paid (in mist)
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+    },
 }
 
 #[tokio::main]
@@ -141,6 +175,67 @@ async fn main() -> Result<()> {
                 .with_storage_object_id(storage_object_id);
             let hash = storage.buy_storage(amount).await?;
             eprintln!("Bought storage quota on-chain: {} (tx {})", amount, hash);
+        }
+
+        Commands::Reclaim {
+            blob_id,
+            storage_object_id,
+            password,
+            now_epoch,
+        } => {
+            let blob_id = BlobID::try_from(blob_id.as_str())?;
+            let storage = KanariStorage::from_config(&password, "cli-node")?
+                .with_storage_object_id(storage_object_id.clone());
+            let now = now_epoch.unwrap_or_else(current_epoch);
+            let storage_id = hex::decode(storage_object_id.trim_start_matches("0x"))
+                .with_context(|| format!("invalid storage object id: {}", storage_object_id))?;
+            let request = mika_types::storage::ReclaimBlobRequest {
+                storage_id,
+                blob_id: blob_id.as_bytes().to_vec(),
+                now_epoch: now,
+            };
+            storage.reclaim_blob(&request).await?;
+            eprintln!(
+                "Reclaimed blob {} on-chain (epoch {}): quota refunded",
+                blob_id, now
+            );
+        }
+
+        Commands::Upgrade {
+            old_blob_id,
+            new_blob_id,
+            owner,
+            commitment,
+            password,
+            storage_object_id,
+            fee,
+        } => {
+            let old_blob_id = BlobID::try_from(old_blob_id.as_str())?;
+            let new_blob_id = BlobID::try_from(new_blob_id.as_str())?;
+            let owner_addr = kanari_types::address::Address::from_hex_literal(&owner)
+                .with_context(|| format!("invalid owner address: {}", owner))?;
+            let commitment_bytes: [u8; 32] = hex::decode(&commitment)
+                .with_context(|| "commitment must be 64 hex chars (32 bytes)")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("commitment must be exactly 32 bytes"))?;
+            let storage = KanariStorage::from_config(&password, "cli-node")?
+                .with_storage_object_id(storage_object_id.clone());
+            let storage_id = hex::decode(storage_object_id.trim_start_matches("0x"))
+                .with_context(|| format!("invalid storage object id: {}", storage_object_id))?;
+            let request = mika_types::storage::UpgradeBlobRequest {
+                storage_id,
+                old_blob_id: old_blob_id.as_bytes().to_vec(),
+                new_blob_id: new_blob_id.as_bytes().to_vec(),
+                owner: owner_addr.to_bytes().to_vec(),
+                commitment: commitment_bytes.to_vec(),
+                epoch: current_epoch(),
+                fee_paid: fee,
+            };
+            storage.upgrade_blob(&request).await?;
+            eprintln!(
+                "Upgraded blob {} -> {} on-chain (fee {} mist)",
+                old_blob_id, new_blob_id, fee
+            );
         }
 
         Commands::Anchor {
@@ -237,16 +332,21 @@ async fn main() -> Result<()> {
 
             // (1/2): STORE slivers + collect write certificates.
             let client = MikaClient::with_store_path(node_addrs.clone(), "./mika-store");
-            let (mut quorum, lease) = client.put_blob(&blob, &params, fee).await?;
-            // Sign the quorum with the uploader's key (Walrus certify needs
-            // a real signature, not the placeholder from put_blob).
-            if let Some(kv) = kanari.as_ref() {
-                let _ = kv.sign_quorum(&mut quorum);
+            let (quorum, lease) = client.put_blob(&blob, &params, fee).await?;
+            // BFT quorum: certificates are already signed by storage nodes.
+            // Verify all signatures and confirm we have a quorum of distinct
+            // nodes (Walrus: 2f+1 committee signatures).
+            if let Some(_kv) = kanari.as_ref() {
+                let ok = mika_core::kanari_integration::verify_quorum(&quorum)?;
                 eprintln!(
-                    "  Signed quorum: {} certs ({} sig bytes total)",
+                    "  Quorum: {} certs, {} distinct nodes, verified={}",
                     quorum.certificates.len(),
-                    quorum.certificates.iter().map(|c| c.signature.len()).sum::<usize>()
+                    quorum.distinct_nodes(),
+                    ok
                 );
+                if !ok {
+                    anyhow::bail!("quorum verification failed: invalid certificate signature");
+                }
             }
 
             // (2/2): CERTIFY on-chain — anchor blob commitment with owner

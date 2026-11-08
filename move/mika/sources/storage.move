@@ -26,6 +26,20 @@ module mika::storage {
         created_at: u64
     }
 
+    public struct BlobUpgradedEvent has copy, drop, store {
+        old_blob_id: address,
+        new_blob_id: address,
+        version: u64,
+        owner: address,
+        fee_paid: u64
+    }
+
+    public struct BlobReclaimedEvent has copy, drop, store {
+        blob_id: address,
+        reclaimed_at: u64,
+        quota_refund: u64
+    }
+
     public struct StorageInitializedEvent has copy, drop, store {
         storage_id: address
     }
@@ -173,6 +187,73 @@ module mika::storage {
                 from,
                 to,
                 rent_transfer_amount
+            }
+        );
+    }
+
+    /// Walrus-style upgrade: a new anchor for the same logical blob (new
+    /// content = new blob_id). Old anchor stays as history; the newest
+    /// anchor for the owner wins. Emits `BlobUpgradedEvent`.
+    public fun upgrade_blob(
+        storage_id: address,
+        old_blob_id: address,
+        new_blob_id: address,
+        owner: address,
+        commitment: vector<u8>,
+        epoch: u64,
+        fee_paid: u64,
+        ctx: &mut TxContext
+    ) {
+        let storage = borrow::borrow_mut<Storage>(storage_id);
+        assert!(blob_exists(&storage.anchors, old_blob_id), E_NOT_OWNER);
+        let old_idx = find_anchor_index(&storage.anchors, old_blob_id);
+        let old_anchor = vector::borrow(&storage.anchors, old_idx);
+        assert!(old_anchor.owner == owner, E_NOT_OWNER);
+        let version = old_anchor.id + 1;
+        let anchor = BlobAnchor {
+            id: version,
+            blob_id: new_blob_id,
+            owner,
+            commitment,
+            epoch,
+            fee_paid,
+            created_at: tx_context::epoch_timestamp_ms(ctx)
+        };
+        vector::push_back(&mut storage.anchors, anchor);
+        event::emit(
+            BlobUpgradedEvent {
+                old_blob_id,
+                new_blob_id,
+                version,
+                owner,
+                fee_paid
+            }
+        );
+    }
+
+    /// Walrus-style lease expiry reclaim: anyone may reclaim a blob whose
+    /// lease has expired (now - anchor.epoch >= 1 epoch). Removes the
+    /// anchor and refunds quota to the Storage object (fee kept on record
+    /// via the reclaimed period).
+    public fun reclaim_blob(
+        storage_id: address,
+        blob_id: address,
+        now_epoch: u64,
+        ctx: &mut TxContext
+    ) {
+        let storage = borrow::borrow_mut<Storage>(storage_id);
+        let idx = find_anchor_index(&storage.anchors, blob_id);
+        let anchor = vector::borrow(&storage.anchors, idx);
+        // One epoch = 86_400s; expired if lease covers >= 1 epoch.
+        let now_ms = tx_context::epoch_timestamp_ms(ctx);
+        assert!(now_ms >= anchor.created_at + 86400000, 7);
+        let anchor = vector::remove(&mut storage.anchors, idx);
+        storage.quota = storage.quota + anchor.fee_paid;
+        event::emit(
+            BlobReclaimedEvent {
+                blob_id,
+                reclaimed_at: now_ms,
+                quota_refund: anchor.fee_paid
             }
         );
     }

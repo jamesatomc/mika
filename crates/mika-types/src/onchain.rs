@@ -8,6 +8,7 @@
 
 use crate::blob::BlobID;
 use crate::error::{MikaStorageError, Result};
+use crate::storage::{ReclaimBlobRequest, UpgradeBlobRequest};
 use kanari_types::address::Address as KanariAddress;
 use kanari_types::gas_coin::GAS_COIN;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,12 @@ pub trait StoragePayment: Send + Sync {
         to: &KanariAddress,
         rent_transfer_amount: u64,
     ) -> Result<()>;
+    /// Reclaim an expired blob's anchor on-chain, refunding quota to the
+    /// Storage object. Callable by anyone once the lease has expired.
+    async fn reclaim_blob(&self, request: &ReclaimBlobRequest) -> Result<()>;
+    /// Upgrade a blob to a new version (new content = new blob_id). Old
+    /// anchor stays as history; the newest anchor for the owner wins.
+    async fn upgrade_blob(&self, request: &UpgradeBlobRequest) -> Result<()>;
 }
 
 /// Compute the native coin type string for KANARI.

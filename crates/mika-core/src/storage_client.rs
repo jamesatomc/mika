@@ -13,6 +13,7 @@ use mika_types::blob::{Blob, BlobID};
 use mika_types::epoch::{Lease, current_epoch};
 use mika_types::error::{MikaStorageError, Result};
 use mika_types::sliver::Sliver;
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Address of a storage node (host:port).
@@ -37,6 +38,14 @@ pub struct StoreResult {
     pub node_id: String,
     pub shard_index: u32,
     pub blob_id: BlobID,
+}
+
+/// Response from `PUT /slivers/{blob_id}/{shard_index}` — node returns its
+/// signed write certificate for BFT quorum.
+#[derive(Deserialize)]
+pub struct PutSliverResponse {
+    pub ok: bool,
+    pub certificate: WriteCertificate,
 }
 
 /// Result of retrieving a sliver from a node.
@@ -136,9 +145,11 @@ impl MikaClient {
         }
     }
 
-    /// Try `PUT /slivers/{blob_id}/{idx}` on the node. Returns true on success.
+    /// Try `PUT /slivers/{blob_id}/{idx}` on the node. Returns the node's
+    /// signed write certificate on success, or None if the node is unreachable
+    /// (local cache only).
     #[cfg(feature = "onchain")]
-    async fn http_put(&self, node: &NodeAddr, sliver: &Sliver) -> bool {
+    async fn http_put(&self, node: &NodeAddr, sliver: &Sliver) -> Result<Option<WriteCertificate>> {
         let url = format!(
             "{}/slivers/{}/{}",
             Self::node_url(node),
@@ -153,14 +164,20 @@ impl MikaClient {
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => true,
+            Ok(resp) if resp.status().is_success() => {
+                let body: PutSliverResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
+                Ok(Some(body.certificate))
+            }
             Ok(resp) => {
                 eprintln!("mika: PUT {url} -> {}", resp.status());
-                false
+                Ok(None)
             }
             Err(e) => {
                 eprintln!("mika: PUT {url} failed ({e}) — local cache only");
-                false
+                Ok(None)
             }
         }
     }
@@ -232,18 +249,46 @@ impl MikaClient {
             self.keyspace
                 .insert(key, bytes)
                 .map_err(|e| MikaStorageError::Io(e.to_string()))?;
-            // Walrus dissemination: replicate to the node's HTTP store too.
+            // Walrus dissemination: replicate to the node's HTTP store and
+            // collect its signed write certificate for BFT quorum.
             #[cfg(feature = "onchain")]
-            let _ = self.http_put(node, &sliver).await;
+            if let Ok(Some(cert)) = self.http_put(node, &sliver).await {
+                quorum.add(cert);
+                continue;
+            }
+            // Fallback: local/unsigned certificate (dev mode or node
+            // unreachable — quorum will not meet BFT threshold).
             quorum.add(WriteCertificate {
                 blob_id: blob.id,
                 shard_index: i as u32,
                 node_id: node.0.clone(),
                 epoch: current_epoch(),
                 sliver_hash: kanari_crypto::hash_data_blake3_array(shard),
-                signature: vec![], // placeholder; real client signs with its key
+                signature: vec![],
                 public_key: String::new(),
                 curve_type: "K256".to_string(),
+            });
+        }
+
+        // BFT quorum check: need at least data_shards distinct nodes.
+        // When certificates carry node signatures (real deployment), verify
+        // them too. In dev/local mode (unsigned certs), signature check is
+        // skipped — quorum is based on distinct node count only.
+        let distinct = quorum.distinct_nodes();
+        let required = params.data_shards;
+        let all_signed = quorum.certificates.iter().all(|c| !c.signature.is_empty());
+        if all_signed {
+            let verified = quorum.verified_count()?;
+            if verified < required || distinct < required {
+                return Err(MikaStorageError::InsufficientShards {
+                    have: verified.min(distinct),
+                    need: required,
+                });
+            }
+        } else if distinct < required {
+            return Err(MikaStorageError::InsufficientShards {
+                have: distinct,
+                need: required,
             });
         }
 

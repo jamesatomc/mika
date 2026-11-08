@@ -14,6 +14,8 @@ use axum::{
     response::Json,
     routing::{get, put},
 };
+use kanari_crypto::hash_data_blake3_array;
+use mika_core::certificate::WriteCertificate;
 use mika_types::blob::BlobID;
 use mika_types::sliver::Sliver;
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,8 @@ pub struct PutResponse {
     pub blob_id: String,
     pub shard_index: u32,
     pub node_id: String,
+    /// Write certificate signed by this storage node (BFT quorum signature).
+    pub certificate: WriteCertificate,
 }
 
 #[derive(Serialize)]
@@ -59,12 +63,30 @@ pub async fn put_sliver(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // Control plane: announce the new shard over gossipsub.
     state.announce_sliver(&blob_id, sliver.shard_index);
+
+    // BFT quorum: this storage node signs a write certificate attesting it
+    // has stored the sliver. The client collects these from 2f+1 nodes.
+    let sliver_hash = hash_data_blake3_array(&sliver.data);
+    let mut cert = WriteCertificate {
+        blob_id,
+        shard_index: sliver.shard_index,
+        node_id: state.node_id.clone(),
+        epoch: state.epoch,
+        sliver_hash,
+        signature: vec![],
+        public_key: state.public_key.clone(),
+        curve_type: format!("{:?}", state.curve_type),
+    };
+    cert.sign(&state.private_key, state.curve_type)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     info!(node = %state.node_id, blob = %blob_id, shard = sliver.shard_index, "stored sliver");
     Ok(Json(PutResponse {
         ok: true,
         blob_id: blob_id.to_hex(),
         shard_index: sliver.shard_index,
         node_id: state.node_id.clone(),
+        certificate: cert,
     }))
 }
 

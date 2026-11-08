@@ -25,7 +25,7 @@ use mika_types::onchain::{BlobAnchor, StorageFeePayment, StoragePayment};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use mika_types::storage::StorageModule;
+use mika_types::storage::{ReclaimBlobRequest, StorageModule, UpgradeBlobRequest};
 
 /// A Mika storage node integrated with the kanari-sdk blockchain.
 ///
@@ -467,6 +467,88 @@ impl StoragePayment for KanariStorage {
 
         let signed_tx = self.build_execute_function_tx(
             StorageModule::function_names().transfer_blob_ownership,
+            args,
+            object_inputs,
+        )?;
+
+        self.submit_transaction(signed_tx).await?;
+        Ok(())
+    }
+
+    async fn reclaim_blob(&self, request: &ReclaimBlobRequest) -> Result<()> {
+        let storage_id = self.storage_object_id.as_deref().ok_or_else(|| {
+            MikaStorageError::OnChain(
+                "storage_object_id not configured. Call with_storage_object_id() first".into(),
+            )
+        })?;
+
+        // Move: reclaim_blob(storage_id: address, blob_id: address, now_epoch: u64,
+        //                   ctx: &mut TxContext)
+        let args = vec![
+            request.storage_id.clone(),
+            request.blob_id.clone(),
+            bcs_to_bytes(&request.now_epoch)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+        ];
+
+        // Object input: Storage object (mutable)
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: storage_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::Shared),
+            mutable: true,
+        }];
+
+        let signed_tx = self.build_execute_function_tx(
+            StorageModule::function_names().reclaim_blob,
+            args,
+            object_inputs,
+        )?;
+
+        self.submit_transaction(signed_tx).await?;
+        Ok(())
+    }
+
+    async fn upgrade_blob(&self, request: &UpgradeBlobRequest) -> Result<()> {
+        let storage_id = self.storage_object_id.as_deref().ok_or_else(|| {
+            MikaStorageError::OnChain(
+                "storage_object_id not configured. Call with_storage_object_id() first".into(),
+            )
+        })?;
+
+        // Move: upgrade_blob(storage_id: address, old_blob_id: address,
+        //                   new_blob_id: address, owner: address,
+        //                   commitment: vector<u8>, epoch: u64, fee_paid: u64,
+        //                   ctx: &mut TxContext)
+        let args = vec![
+            request.storage_id.clone(),
+            request.old_blob_id.clone(),
+            request.new_blob_id.clone(),
+            request.owner.clone(),
+            bcs_to_bytes(&request.commitment)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            bcs_to_bytes(&request.epoch)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            bcs_to_bytes(&request.fee_paid)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+        ];
+
+        // Object input: Storage object (mutable)
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: storage_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::Shared),
+            mutable: true,
+        }];
+
+        let signed_tx = self.build_execute_function_tx(
+            StorageModule::function_names().upgrade_blob,
             args,
             object_inputs,
         )?;
