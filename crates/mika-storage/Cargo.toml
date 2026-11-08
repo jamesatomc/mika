@@ -27,6 +27,7 @@ kanari-rpc-api = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 async-trait = { workspace = true }
 fjall = { workspace = true }
+reqwest = { workspace = true, optional = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
@@ -35,4 +36,4 @@ rand = { workspace = true }
 
 [features]
 default = []
-onchain = ["kanari-core", "kanari-common", "kanari-rpc-client", "kanari-rpc-api"]
+onchain = ["kanari-core", "kanari-common", "kanari-rpc-client", "kanari-rpc-api", "reqwest"]

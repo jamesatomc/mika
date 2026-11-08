@@ -104,6 +104,18 @@ enum Commands {
         #[arg(long, default_value_t = 1000)]
         fee: u64,
     },
+    /// Buy storage quota on-chain (Walrus `buy_storage`)
+    Buy {
+        /// Quota amount (in mist units recorded on the Storage object)
+        #[arg(short, long)]
+        amount: u64,
+        /// Keystore password for decrypting the signing key
+        #[arg(long)]
+        password: String,
+        /// Storage object ID on-chain
+        #[arg(long)]
+        storage_object_id: String,
+    },
 }
 
 #[tokio::main]
@@ -111,6 +123,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Buy {
+            amount,
+            password,
+            storage_object_id,
+        } => {
+            let storage =
+                KanariStorage::from_config(&password, "cli-node")?.with_storage_object_id(storage_object_id);
+            let hash = storage.buy_storage(amount).await?;
+            println!("Bought storage quota on-chain: {} (tx {})", amount, hash);
+        }
+
         Commands::Anchor {
             blob_id,
             owner,
@@ -212,12 +235,9 @@ async fn main() -> Result<()> {
             // the "pay on upload" step for Walrus-style certify).
             if !no_anchor {
                 if let Some(kv) = kanari.as_ref() {
-                    // Commitment = blob_id (blake3 content root, 32 bytes).
-                    let commitment: [u8; 32] = blob
-                        .id
-                        .as_bytes()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("blob id must be 32 bytes"))?;
+                    // 2D commitment (Walrus Red-Stuff style): verifiable per-sliver,
+                    // not just the 1D blob hash.
+                    let commitment = mika_storage::commitment::blob_commitment(&blob.data, &params);
                     let owner = kanari_types::address::Address::from_hex_literal(kv.address())
                         .with_context(|| format!("invalid owner address: {}", kv.address()))?;
                     let anchor = BlobAnchor {
@@ -233,9 +253,11 @@ async fn main() -> Result<()> {
                             println!("  anchor_blob (certify) committed");
                         }
                         Err(e) => {
+                            // Idempotent on retry: an already-anchored blob aborts
+                            // on-chain (E_BLOB_ALREADY_ANCHORED) — treat as ok.
+                            // (RPC surfaces only hash+status, so this is a
+                            // warning either way; the blob stays retrievable.)
                             eprintln!("Warning: anchor_blob after quorum failed: {e}");
-                            // Do not delete stored slivers — blob is retrievable
-                            // off-chain; anchor can be retried separately.
                         }
                     }
                 }

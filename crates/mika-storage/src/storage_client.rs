@@ -67,12 +67,20 @@ pub trait StorageClient: Send + Sync {
 ///
 /// Slivers are persisted in an on-disk fjall LSM-tree keyed by
 /// `blob_id (32 bytes) || shard_index (4 bytes LE)`.
+///
+/// **Walrus dissemination:** `put_blob` / `get_blob` / `store_sliver` also
+/// replicate over HTTP to the configured nodes (`PUT /slivers/...`,
+/// `GET /slivers/...`). Local fjall remains as cache/offline fallback so
+/// single-node dev and unit tests (fake `node-a:1234` hosts) keep working.
+/// Node URLs without a scheme default to `http://{host}:{port}`.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct MikaClient {
     pub nodes: Vec<NodeAddr>,
     db: Database,
     keyspace: Keyspace,
+    #[cfg(feature = "onchain")]
+    http: reqwest::Client,
 }
 
 impl MikaClient {
@@ -92,6 +100,8 @@ impl MikaClient {
             nodes,
             db,
             keyspace,
+            #[cfg(feature = "onchain")]
+            http: reqwest::Client::new(),
         }
     }
 
@@ -110,6 +120,62 @@ impl MikaClient {
             nodes,
             db,
             keyspace,
+            #[cfg(feature = "onchain")]
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Normalize a node address to an HTTP base URL (`http://host:port`).
+    #[cfg(feature = "onchain")]
+    fn node_url(node: &NodeAddr) -> String {
+        let s = node.0.trim();
+        if s.starts_with("http://") || s.starts_with("https://") {
+            s.trim_end_matches('/').to_string()
+        } else {
+            format!("http://{s}")
+        }
+    }
+
+    /// Try `PUT /slivers/{blob_id}/{idx}` on the node. Returns true on success.
+    #[cfg(feature = "onchain")]
+    async fn http_put(&self, node: &NodeAddr, sliver: &Sliver) -> bool {
+        let url = format!(
+            "{}/slivers/{}/{}",
+            Self::node_url(node),
+            sliver.blob_id.to_hex(),
+            sliver.shard_index
+        );
+        match self
+            .http
+            .put(&url)
+            .header("content-type", "application/octet-stream")
+            .body(sliver.data.clone())
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => true,
+            Ok(resp) => {
+                eprintln!("mika: PUT {url} -> {}", resp.status());
+                false
+            }
+            Err(e) => {
+                eprintln!("mika: PUT {url} failed ({e}) — local cache only");
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "onchain")]
+    async fn http_get(&self, node: &NodeAddr, blob_id: &BlobID, shard: u32) -> Option<Vec<u8>> {
+        let url = format!(
+            "{}/slivers/{}/{}",
+            Self::node_url(node),
+            blob_id.to_hex(),
+            shard
+        );
+        match self.http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.bytes().await.ok().map(|b| b.to_vec()),
+            _ => None,
         }
     }
 
@@ -166,6 +232,9 @@ impl MikaClient {
             self.keyspace
                 .insert(key, bytes)
                 .map_err(|e| MikaStorageError::Io(e.to_string()))?;
+            // Walrus dissemination: replicate to the node's HTTP store too.
+            #[cfg(feature = "onchain")]
+            let _ = self.http_put(node, &sliver).await;
             quorum.add(WriteCertificate {
                 blob_id: blob.id,
                 shard_index: i as u32,
@@ -178,7 +247,8 @@ impl MikaClient {
             });
         }
 
-        let lease = Lease::new(blob.id, 86400, fee);
+        // Lease TTL is epoch-driven (Walrus): fee buys whole epochs.
+        let lease = Lease::new_for_epochs(blob.id, crate::epoch::epochs_for_fee(fee), fee);
         Ok((quorum, lease))
     }
 
@@ -189,8 +259,21 @@ impl MikaClient {
         let mut original_len: Option<usize> = None;
 
         for (i, present_slot) in present.iter_mut().enumerate().take(n) {
-            // Try each node until we find the shard.
+            // Try each node until we find the shard (Walrus: HTTP first,
+            // local fjall cache second).
             for node in &self.nodes {
+                #[cfg(feature = "onchain")]
+                if let Some(bytes) = self.http_get(node, blob_id, i as u32).await {
+                    if let Ok(sliver) = Sliver::from_bytes(&bytes) {
+                        if sliver.blob_id == *blob_id {
+                            *present_slot = Some(sliver.data.clone());
+                            if original_len.is_none() {
+                                original_len = Some(sliver.original_len as usize);
+                            }
+                            break;
+                        }
+                    }
+                }
                 let key = Self::sliver_key(&node.0, i as u32);
                 if let Some(bytes) = self
                     .keyspace
@@ -226,6 +309,8 @@ impl StorageClient for MikaClient {
         self.keyspace
             .insert(key, bytes)
             .map_err(|e| MikaStorageError::Io(e.to_string()))?;
+        #[cfg(feature = "onchain")]
+        let _ = self.http_put(node, sliver).await;
         Ok(StoreResult {
             node_id: node.0.clone(),
             shard_index: sliver.shard_index,
@@ -239,6 +324,16 @@ impl StorageClient for MikaClient {
         blob_id: &BlobID,
         shard_index: u32,
     ) -> Result<RetrieveResult> {
+        #[cfg(feature = "onchain")]
+        if let Some(bytes) = self.http_get(node, blob_id, shard_index).await {
+            let sliver = Sliver::from_bytes(&bytes)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
+            return Ok(RetrieveResult {
+                node_id: node.0.clone(),
+                shard_index,
+                data: sliver.data,
+            });
+        }
         let key = Self::sliver_key(&node.0, shard_index);
         let bytes = self
             .keyspace

@@ -464,6 +464,38 @@ impl StoragePayment for KanariStorage {
     }
 }
 
+impl KanariStorage {
+    /// Walrus-style: buy storage quota on-chain (top-up `Storage.quota`).
+    /// The quota persists on the shared Storage object; per-blob anchors
+    /// record their own `fee_paid` against it.
+    pub async fn buy_storage(&self, amount: u64) -> Result<String> {
+        let storage_id = self.storage_object_id.as_deref().ok_or_else(|| {
+            MikaStorageError::OnChain(
+                "storage_object_id not configured. Call with_storage_object_id() first".into(),
+            )
+        })?;
+        // Move: buy_storage(storage_id: address, amount: u64)
+        let storage_addr = KanariAddress::from_hex_literal(storage_id)
+            .map_err(|e| MikaStorageError::OnChain(format!("bad storage id {storage_id}: {e}")))?;
+        let args = vec![
+            storage_addr.to_bytes().to_vec(),
+            bcs_to_bytes(&amount)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+        ];
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: storage_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::Shared),
+            mutable: true,
+        }];
+        let signed_tx = self.build_execute_function_tx("buy_storage", args, object_inputs)?;
+        self.submit_transaction(signed_tx).await
+    }
+}
+
 /// Verify all certificates in a WriteCertificateQuorum.
 pub fn verify_quorum(quorum: &WriteCertificateQuorum) -> Result<bool> {
     quorum.verify_all()

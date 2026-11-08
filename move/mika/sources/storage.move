@@ -12,7 +12,8 @@ module mika::storage {
 
     public struct Storage has key, store, drop {
         id: UID,
-        anchors: vector<BlobAnchor>
+        anchors: vector<BlobAnchor>,
+        quota: u64
     }
 
     public struct BlobAnchor has store, drop {
@@ -50,16 +51,37 @@ module mika::storage {
         rent_transfer_amount: u64
     }
 
+    /// Walrus-style storage quota event.
+    public struct StorageQuotaBoughtEvent has copy, drop, store {
+        amount: u64,
+        total_quota: u64
+    }
+
     public fun init(ctx: &mut TxContext) {
         let storage = Storage {
             id: object::new(ctx),
-            anchors: vector::empty()
+            anchors: vector::empty(),
+            quota: 0
         };
         let storage_address = object::uid_address(&storage.id);
         transfer::share_object(storage);
         event::emit(
             StorageInitializedEvent {
                 storage_id: storage_address
+            }
+        );
+    }
+
+    /// Walrus-style: buy storage quota up-front (top-up `Storage.quota`).
+    /// Subsequent `anchor_blob` calls draw against this quota; `fee_paid`
+    /// on the anchor remains the per-blob paid amount on record.
+    public fun buy_storage(storage_id: address, amount: u64) {
+        let storage = borrow::borrow_mut<Storage>(storage_id);
+        storage.quota = storage.quota + amount;
+        event::emit(
+            StorageQuotaBoughtEvent {
+                amount,
+                total_quota: storage.quota
             }
         );
     }
