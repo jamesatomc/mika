@@ -7,18 +7,25 @@
 //! binds both Merkle roots plus k/m into the final on-chain commitment.
 //! Any single sliver can be verified against the on-chain commitment with
 //! just its Merkle proof — no need for the whole blob.
+//!
+//! Merkle tree operations use the `smt` crate (domain-separated BLAKE3:
+//! H(0x01 || left || right) for internal nodes).
 
 use serde::{Deserialize, Serialize};
 
+use smt::{compute_merkle_root, digest, generate_merkle_proof, verify_merkle_proof};
+
 use crate::erasure::{ErasureParams, encode, split_into_shards};
-use kanari_crypto::hash_data_blake3_array;
 
 /// A Merkle proof: the sibling hashes on the path from a leaf up to the
 /// root, plus the leaf's index and the root hash.
+///
+/// Siblings are stored as `Vec<Vec<u8>>` to match the `smt` crate's proof
+/// format (empty entries indicate pass-through nodes in odd-sized trees).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerkleProof {
     pub leaf_index: usize,
-    pub siblings: Vec<[u8; 32]>,
+    pub siblings: Vec<Vec<u8>>,
     pub root: [u8; 32],
 }
 
@@ -39,69 +46,25 @@ pub struct Commitment2D {
     pub commitment: [u8; 32],
 }
 
-/// Hash a pair of 32-byte values: `blake3(left || right)`.
-fn hash_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&left);
-    buf.extend_from_slice(&right);
-    hash_data_blake3_array(&buf)
-}
-
 /// Build a Merkle tree over leaf hashes and return the root.
-/// Odd leaf counts are handled by duplicating the last leaf at each level.
 fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
-        return hash_data_blake3_array(b"");
+        return [0u8; 32];
     }
-    let mut level: Vec<[u8; 32]> = leaves.to_vec();
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            if pair.len() == 2 {
-                next.push(hash_pair(pair[0], pair[1]));
-            } else {
-                // Odd one out: hash with itself.
-                next.push(hash_pair(pair[0], pair[0]));
-            }
-        }
-        level = next;
-    }
-    level[0]
+    let tx_hashes: Vec<Vec<u8>> = leaves.iter().map(|l| l.to_vec()).collect();
+    let root_vec = compute_merkle_root(&tx_hashes);
+    root_vec.as_slice().try_into().unwrap_or([0u8; 32])
 }
 
 /// Generate a Merkle proof for the leaf at `index`.
-/// Returns the sibling hashes from leaf to root, plus the root.
 fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Option<MerkleProof> {
     if index >= leaves.len() {
         return None;
     }
-    let root = merkle_root(leaves);
-    let mut siblings = Vec::new();
-    let mut level = leaves.to_vec();
-    let mut idx = index;
-    while level.len() > 1 {
-        let pair_start = (idx / 2) * 2;
-        let sibling = if pair_start + 1 < level.len() {
-            if idx.is_multiple_of(2) {
-                level[pair_start + 1] // right sibling
-            } else {
-                level[pair_start] // left sibling
-            }
-        } else {
-            level[pair_start] // odd one out: duplicate itself
-        };
-        siblings.push(sibling);
-        idx /= 2;
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            if pair.len() == 2 {
-                next.push(hash_pair(pair[0], pair[1]));
-            } else {
-                next.push(hash_pair(pair[0], pair[0]));
-            }
-        }
-        level = next;
-    }
+    let tx_hashes: Vec<Vec<u8>> = leaves.iter().map(|l| l.to_vec()).collect();
+    let root_vec = compute_merkle_root(&tx_hashes);
+    let root: [u8; 32] = root_vec.as_slice().try_into().unwrap_or([0u8; 32]);
+    let siblings = generate_merkle_proof(&tx_hashes, index);
     Some(MerkleProof {
         leaf_index: index,
         siblings,
@@ -111,22 +74,11 @@ fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Option<MerkleProof> {
 
 /// Verify a Merkle proof: recompute the path from `leaf` up to `proof.root`
 /// using the sibling hashes.
-fn verify_merkle_proof(leaf: &[u8; 32], proof: &MerkleProof) -> bool {
+fn verify_merkle_proof_smt(leaf: &[u8; 32], proof: &MerkleProof) -> bool {
     if proof.siblings.is_empty() {
-        // Single-leaf tree: root == leaf.
         return *leaf == proof.root;
     }
-    let mut current = *leaf;
-    let mut idx = proof.leaf_index;
-    for sibling in &proof.siblings {
-        current = if idx.is_multiple_of(2) {
-            hash_pair(current, *sibling) // left node
-        } else {
-            hash_pair(*sibling, current) // right node
-        };
-        idx /= 2;
-    }
-    current == proof.root
+    verify_merkle_proof(leaf, proof.leaf_index, &proof.siblings, &proof.root)
 }
 
 /// Build a full 2D commitment from pre-encoded shards.
@@ -136,14 +88,8 @@ pub fn build_commitment_2d(encoded: &[Vec<u8>], params: &ErasureParams) -> Commi
     let data_shards = &encoded[..k];
     let parity_shards = &encoded[k..];
 
-    let data_roots: Vec<[u8; 32]> = data_shards
-        .iter()
-        .map(|s| hash_data_blake3_array(s))
-        .collect();
-    let parity_roots: Vec<[u8; 32]> = parity_shards
-        .iter()
-        .map(|s| hash_data_blake3_array(s))
-        .collect();
+    let data_roots: Vec<[u8; 32]> = data_shards.iter().map(|s| digest(s)).collect();
+    let parity_roots: Vec<[u8; 32]> = parity_shards.iter().map(|s| digest(s)).collect();
 
     let data_root = merkle_root(&data_roots);
     let parity_root = merkle_root(&parity_roots);
@@ -153,7 +99,7 @@ pub fn build_commitment_2d(encoded: &[Vec<u8>], params: &ErasureParams) -> Commi
     buf.push(params.parity_shards as u8);
     buf.extend_from_slice(&data_root);
     buf.extend_from_slice(&parity_root);
-    let commitment = hash_data_blake3_array(&buf);
+    let commitment = digest(&buf);
 
     Commitment2D {
         data_roots,
@@ -198,8 +144,8 @@ pub fn verify_shard_2d(
     if proof.leaf_index != shard_index {
         return false;
     }
-    let leaf = hash_data_blake3_array(shard);
-    if !verify_merkle_proof(&leaf, proof) {
+    let leaf = digest(shard);
+    if !verify_merkle_proof_smt(&leaf, proof) {
         return false;
     }
     let mut buf = Vec::with_capacity(66);
@@ -207,7 +153,7 @@ pub fn verify_shard_2d(
     buf.push(params.parity_shards as u8);
     buf.extend_from_slice(&proof.root); // data_root from the proof
     buf.extend_from_slice(&parity_root);
-    hash_data_blake3_array(&buf) == commitment
+    digest(&buf) == commitment
 }
 
 /// The on-chain commitment hash: `blake3(k || m || data_root || parity_root)`.
@@ -229,14 +175,14 @@ pub fn verify_shard(
     if shard_index >= row_roots.len() {
         return false;
     }
-    if hash_data_blake3_array(shard) != row_roots[shard_index] {
+    if digest(shard) != row_roots[shard_index] {
         return false;
     }
     let mut buf = vec![params.data_shards as u8, params.parity_shards as u8];
     for r in row_roots {
         buf.extend_from_slice(r);
     }
-    hash_data_blake3_array(&buf) == *commitment
+    digest(&buf) == *commitment
 }
 
 /// BlobID ↔ commitment helper for tests: commitment changes if data changes.
@@ -259,10 +205,10 @@ mod tests {
     fn merkle_root_even_count() {
         let leaves: Vec<[u8; 32]> = (0..4).map(|i| [i as u8; 32]).collect();
         let root = merkle_root(&leaves);
-        // root = hash(hash(l0,l1), hash(l2,l3))
-        let expected = hash_pair(
-            hash_pair(leaves[0], leaves[1]),
-            hash_pair(leaves[2], leaves[3]),
+        // root = hash_node(hash(l0,l1), hash(l2,l3)) with domain separation
+        let expected = smt::hash_node(
+            &smt::hash_node(&leaves[0], &leaves[1]),
+            &smt::hash_node(&leaves[2], &leaves[3]),
         );
         assert_eq!(root, expected);
     }
@@ -271,12 +217,9 @@ mod tests {
     fn merkle_root_odd_count() {
         let leaves: Vec<[u8; 32]> = (0..3).map(|i| [i as u8; 32]).collect();
         let root = merkle_root(&leaves);
-        // level 1: hash(l0,l1), hash(l2,l2)
-        // root: hash(hash(l0,l1), hash(l2,l2))
-        let expected = hash_pair(
-            hash_pair(leaves[0], leaves[1]),
-            hash_pair(leaves[2], leaves[2]),
-        );
+        // level 1: hash_node(l0,l1), pass-through l2
+        // root: hash_node(hash_node(l0,l1), l2)
+        let expected = smt::hash_node(&smt::hash_node(&leaves[0], &leaves[1]), &leaves[2]);
         assert_eq!(root, expected);
     }
 
@@ -287,7 +230,7 @@ mod tests {
         for i in 0..leaves.len() {
             let proof = merkle_proof(&leaves, i).unwrap();
             assert_eq!(proof.root, root);
-            assert!(verify_merkle_proof(&leaves[i], &proof));
+            assert!(verify_merkle_proof_smt(&leaves[i], &proof));
         }
     }
 
@@ -297,7 +240,7 @@ mod tests {
         let proof = merkle_proof(&leaves, 0).unwrap();
         let mut bad_leaf = leaves[0];
         bad_leaf[0] ^= 0xFF;
-        assert!(!verify_merkle_proof(&bad_leaf, &proof));
+        assert!(!verify_merkle_proof_smt(&bad_leaf, &proof));
     }
 
     #[test]

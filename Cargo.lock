@@ -3928,6 +3928,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "smt",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
