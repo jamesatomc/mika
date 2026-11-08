@@ -1,0 +1,26 @@
+[package]
+name = "mika"
+version = "0.0.1"
+edition = "2024"
+# license = ""           # e.g., "MIT", "GPL", "Apache 2.0"
+# authors = ["..."]      # e.g., ["Joe Smith (joesmith@noemail.com)", "John Snow (johnsnow@noemail.com)"]
+
+[dependencies]
+# Dependencies point to the Kanari SDK for framework and stdlib
+KanariSystem = { git = "https://github.com/kanari-network/kanari-sdk.git", subdir = "crates/kanari-frameworks/packages/kanari-system", rev = "kanari-sdk" }
+MoveStdlib = { git = "https://github.com/kanari-network/kanari-sdk.git", subdir = "crates/kanari-frameworks/packages/move-stdlib", rev = "kanari-sdk" }
+# For remote import, use the `{ git = "...", subdir = "...", rev = "..." }`.
+# Revision can be a branch, a tag, and a commit hash.
+# MyRemotePackage = { git = "https://some.remote/host.git", subdir = "remote/path", rev = "main" }
+
+# For local dependencies use `local = path`. Path is relative to the package root
+# Local = { local = "../path/to" }
+
+# To resolve a version conflict and force a specific version for dependency
+# override use `override = true`
+# Override = { local = "../conflicting/version", override = true }
+
+[addresses]
+mika = "0x3ba63b92aac5f2bff87e580e820b61faf1c5fe9ae12f0bc8addd931a340b3146"
+std = "0x1"
+kanari_system = "0x2"

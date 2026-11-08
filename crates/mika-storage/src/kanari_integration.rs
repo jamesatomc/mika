@@ -13,6 +13,7 @@ use crate::blob::BlobID;
 use crate::certificate::{WriteCertificate, WriteCertificateQuorum};
 use crate::error::{MikaStorageError, Result};
 use crate::onchain::{BlobAnchor, StorageFeePayment, StoragePayment};
+use bcs::to_bytes as bcs_to_bytes;
 use hex::encode as hex_encode;
 use kanari_common::{get_active_address, load_kanari_config};
 use kanari_core::BlockchainEngine;
@@ -21,8 +22,17 @@ use kanari_crypto::{
     encryption::decrypt_data,
     keys::{CurveType, keypair_from_private_key},
 };
+use kanari_types::address::Address as KanariAddress;
+use kanari_types::transaction::{
+    GasPayment, ObjectInput, ObjectOwnerKind, ObjectRef, SignedTransaction, Transaction,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Mika Move module address (where the storage contract is deployed).
+const MIKA_MODULE_ADDRESS: &str = "0x3ba63b92aac5f2bff87e580e820b61faf1c5fe9ae12f0bc8addd931a340b3146";
+/// Mika Move module name.
+const MIKA_MODULE_NAME: &str = "mika::storage";
 
 /// A Mika storage node integrated with the kanari-sdk blockchain.
 ///
@@ -37,6 +47,9 @@ pub struct KanariStorage {
     address: String,
     curve_type: CurveType,
     node_id: String,
+    /// Storage object ID created during genesis init of the Mika Move module.
+    /// Set via [`KanariStorage::with_storage_object_id`] after module deploy.
+    storage_object_id: Option<String>,
 }
 
 impl KanariStorage {
@@ -90,6 +103,7 @@ impl KanariStorage {
             address: active_address,
             curve_type: CurveType::K256,
             node_id: node_id.into(),
+            storage_object_id: None,
         })
     }
 
@@ -110,7 +124,21 @@ impl KanariStorage {
             address: keypair.address,
             curve_type,
             node_id: node_id.into(),
+            storage_object_id: None,
         })
+    }
+
+    /// Set the Storage object ID (returned from genesis `StorageInitializedEvent`).
+    /// Required before calling `anchor_blob`, `pay_storage_rent`, or
+    /// `transfer_blob_ownership`.
+    pub fn with_storage_object_id(mut self, storage_object_id: impl Into<String>) -> Self {
+        self.storage_object_id = Some(storage_object_id.into());
+        self
+    }
+
+    /// Return the Storage object ID, if configured.
+    pub fn storage_object_id(&self) -> Option<&str> {
+        self.storage_object_id.as_deref()
     }
 
     /// Return the node's kanari address.
@@ -147,45 +175,175 @@ impl KanariStorage {
     pub fn engine(&self) -> Arc<RwLock<BlockchainEngine>> {
         self.engine.clone()
     }
+
+    /// Build a `SignedTransaction` that calls a Mika Move module function.
+    fn build_execute_function_tx(
+        &self,
+        function: &str,
+        args: Vec<Vec<u8>>,
+        object_inputs: Vec<ObjectInput>,
+    ) -> Result<SignedTransaction> {
+        let sender = self.address.clone();
+        let module = format!("{}::{}", MIKA_MODULE_ADDRESS, MIKA_MODULE_NAME);
+
+        let gas_payment = Some(GasPayment {
+            payment_objects: vec![],
+            owner: self.address.clone(),
+            budget: 1_000_000_000,
+            price: 1000,
+            coin_type: None,
+            price_version: None,
+        });
+
+        let tx = Transaction::ExecuteFunction {
+            sender,
+            module,
+            function: function.to_string(),
+            type_args: vec![],
+            args,
+            object_inputs,
+            gas_payment,
+            gas_limit: 1_000_000_000,
+            gas_price: 1000,
+            nonce: 0,
+        };
+
+        let mut signed_tx = SignedTransaction::new(tx);
+        signed_tx
+            .sign(&self.private_key, self.curve_type)
+            .map_err(|e| MikaStorageError::Crypto(e.to_string()))?;
+
+        Ok(signed_tx)
+    }
+
+    /// Submit a signed transaction via BlockchainEngine.
+    /// Submits to mempool, then produces an owned fast checkpoint.
+    async fn submit_transaction(&self, signed_tx: SignedTransaction) -> Result<()> {
+        let engine = self.engine.read().await;
+
+        // Submit to mempool
+        engine
+            .submit_transactions_batch(vec![signed_tx])
+            .map_err(|e| MikaStorageError::OnChain(e.to_string()))?;
+
+        // Produce checkpoint to execute the transaction
+        engine
+            .produce_owned_fast_checkpoint()
+            .map_err(|e| MikaStorageError::OnChain(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 impl StoragePayment for KanariStorage {
     async fn pay_storage_rent(&self, payment: &StorageFeePayment) -> Result<()> {
-        // Submit a native KANARI transfer transaction via BlockchainEngine
-        // to pay storage rent from the payer's account.
-        let _engine = self.engine.read().await;
-        let _payment = payment;
-        // TODO: Implement using BlockchainEngine's transaction submission API
-        Err(MikaStorageError::OnChain(
-            "pay_storage_rent not yet implemented against BlockchainEngine".into(),
-        ))
+        let storage_id = self.storage_object_id.as_deref().ok_or_else(|| {
+            MikaStorageError::OnChain(
+                "storage_object_id not configured. Call with_storage_object_id() first".into(),
+            )
+        })?;
+
+        // Args: blob_id (vector<u8>), amount (u64)
+        let args = vec![
+            bcs_to_bytes(&payment.blob_id.as_bytes().to_vec())
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            bcs_to_bytes(&payment.amount)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+        ];
+
+        // Object input: Storage object (mutable)
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: storage_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::AddressOwner(self.address.clone())),
+            mutable: true,
+        }];
+
+        let signed_tx = self.build_execute_function_tx("pay_storage_rent", args, object_inputs)?;
+
+        self.submit_transaction(signed_tx).await
     }
 
     async fn anchor_blob(&self, anchor: &BlobAnchor) -> Result<()> {
-        // Anchor blob metadata on-chain via BlockchainEngine.
-        let _engine = self.engine.read().await;
-        let _anchor = anchor;
-        Err(MikaStorageError::OnChain(
-            "anchor_blob not yet implemented against BlockchainEngine".into(),
-        ))
+        let storage_id = self.storage_object_id.as_deref().ok_or_else(|| {
+            MikaStorageError::OnChain(
+                "storage_object_id not configured. Call with_storage_object_id() first".into(),
+            )
+        })?;
+
+        // Args: blob_id (vector<u8>), owner (address), commitment (vector<u8>),
+        // epoch (u64), fee_paid (u64)
+        let args = vec![
+            bcs_to_bytes(&anchor.blob_id.as_bytes().to_vec())
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            anchor.owner.to_bytes().to_vec(),
+            bcs_to_bytes(&anchor.commitment.to_vec())
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            bcs_to_bytes(&anchor.epoch)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            bcs_to_bytes(&anchor.fee_paid)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+        ];
+
+        // Object input: Storage object (mutable)
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: storage_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::AddressOwner(self.address.clone())),
+            mutable: true,
+        }];
+
+        let signed_tx = self.build_execute_function_tx("anchor_blob", args, object_inputs)?;
+
+        self.submit_transaction(signed_tx).await
     }
 
     async fn transfer_blob_ownership(
         &self,
         blob_id: &BlobID,
-        from: &kanari_types::address::Address,
-        to: &kanari_types::address::Address,
+        from: &KanariAddress,
+        to: &KanariAddress,
         rent_transfer_amount: u64,
     ) -> Result<()> {
-        let _engine = self.engine.read().await;
-        let _blob_id = blob_id;
-        let _from = from;
-        let _to = to;
-        let _rent_transfer_amount = rent_transfer_amount;
-        Err(MikaStorageError::OnChain(
-            "transfer_blob_ownership not yet implemented against BlockchainEngine".into(),
-        ))
+        let storage_id = self.storage_object_id.as_deref().ok_or_else(|| {
+            MikaStorageError::OnChain(
+                "storage_object_id not configured. Call with_storage_object_id() first".into(),
+            )
+        })?;
+
+        // Args: blob_id (vector<u8>), from (address), to (address),
+        // rent_transfer_amount (u64)
+        let args = vec![
+            bcs_to_bytes(&blob_id.as_bytes().to_vec())
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            from.to_bytes().to_vec(),
+            to.to_bytes().to_vec(),
+            bcs_to_bytes(&rent_transfer_amount)
+                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+        ];
+
+        // Object input: Storage object (mutable)
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: storage_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::AddressOwner(self.address.clone())),
+            mutable: true,
+        }];
+
+        let signed_tx =
+            self.build_execute_function_tx("transfer_blob_ownership", args, object_inputs)?;
+
+        self.submit_transaction(signed_tx).await
     }
 }
 
@@ -208,6 +366,7 @@ mod tests {
         .unwrap();
         assert!(!storage.public_key().is_empty());
         assert_eq!(storage.node_id(), "node-1");
+        assert!(storage.storage_object_id().is_none());
     }
 
     #[test]
@@ -232,5 +391,17 @@ mod tests {
         });
         storage.sign_quorum(&mut quorum).unwrap();
         assert!(verify_quorum(&quorum).unwrap());
+    }
+
+    #[test]
+    fn kanari_storage_with_storage_object_id() {
+        let storage = KanariStorage::from_private_key(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            CurveType::K256,
+            "node-1",
+        )
+        .unwrap();
+        let storage_with_id = storage.with_storage_object_id("0xabc123");
+        assert_eq!(storage_with_id.storage_object_id(), Some("0xabc123"));
     }
 }
