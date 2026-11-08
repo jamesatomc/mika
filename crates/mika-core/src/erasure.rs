@@ -5,7 +5,7 @@
 //! shards while still being able to reconstruct the original data from any `k`
 //! surviving shards.
 
-use crate::error::{MikaStorageError, Result};
+use mika_types::error::{MikaStorageError, Result};
 
 /// Pre-computed GF(256) log and exp tables.
 struct GfTables {

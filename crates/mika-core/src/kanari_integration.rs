@@ -9,10 +9,7 @@
 //! [`kanari_common`], which reads `~/.kanari/kanari_config/kanari.yaml` and
 //! decrypts the keystore at the configured `keystore_path`.
 
-use crate::blob::BlobID;
 use crate::certificate::{WriteCertificate, WriteCertificateQuorum};
-use crate::error::{MikaStorageError, Result};
-use crate::onchain::{BlobAnchor, StorageFeePayment, StoragePayment};
 use bcs::to_bytes as bcs_to_bytes;
 use kanari_common::{get_active_address, load_kanari_config};
 use kanari_core::BlockchainEngine;
@@ -22,14 +19,13 @@ use kanari_types::address::Address as KanariAddress;
 use kanari_types::transaction::{
     GasPayment, ObjectInput, ObjectOwnerKind, ObjectRef, SignedTransaction, Transaction,
 };
+use mika_types::blob::BlobID;
+use mika_types::error::{MikaStorageError, Result};
+use mika_types::onchain::{BlobAnchor, StorageFeePayment, StoragePayment};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Mika Move module address (where the storage contract is deployed).
-const MIKA_MODULE_ADDRESS: &str =
-    "0x3ba63b92aac5f2bff87e580e820b61faf1c5fe9ae12f0bc8addd931a340b3146";
-/// Mika Move module name (the module *inside* package `mika`).
-const MIKA_MODULE_NAME: &str = "storage";
+use mika_types::storage::StorageModule;
 
 /// A Mika storage node integrated with the kanari-sdk blockchain.
 ///
@@ -185,7 +181,7 @@ impl KanariStorage {
         // RPC verification requires tagged sender: `CurveType:public_key`
         // (ko `kanari move` uses `get_sender_for_tx` for the same reason).
         let sender = format!("{}:{}", self.curve_type, self.public_key);
-        let module = format!("{}::{}", MIKA_MODULE_ADDRESS, MIKA_MODULE_NAME);
+        let module = StorageModule::MODULE_FULL_ID.to_string();
 
         let gas_payment = Some(GasPayment {
             payment_objects: vec![],
@@ -372,7 +368,11 @@ impl StoragePayment for KanariStorage {
             mutable: true,
         }];
 
-        let signed_tx = self.build_execute_function_tx("pay_storage_rent", args, object_inputs)?;
+        let signed_tx = self.build_execute_function_tx(
+            StorageModule::function_names().pay_storage_rent,
+            args,
+            object_inputs,
+        )?;
 
         self.submit_transaction(signed_tx).await?;
         Ok(())
@@ -413,7 +413,11 @@ impl StoragePayment for KanariStorage {
             mutable: true,
         }];
 
-        let signed_tx = self.build_execute_function_tx("anchor_blob", args, object_inputs)?;
+        let signed_tx = self.build_execute_function_tx(
+            StorageModule::function_names().anchor_blob,
+            args,
+            object_inputs,
+        )?;
 
         self.submit_transaction(signed_tx).await?;
         Ok(())
@@ -456,8 +460,11 @@ impl StoragePayment for KanariStorage {
             mutable: true,
         }];
 
-        let signed_tx =
-            self.build_execute_function_tx("transfer_blob_ownership", args, object_inputs)?;
+        let signed_tx = self.build_execute_function_tx(
+            StorageModule::function_names().transfer_blob_ownership,
+            args,
+            object_inputs,
+        )?;
 
         self.submit_transaction(signed_tx).await?;
         Ok(())
@@ -490,7 +497,11 @@ impl KanariStorage {
             owner: Some(ObjectOwnerKind::Shared),
             mutable: true,
         }];
-        let signed_tx = self.build_execute_function_tx("buy_storage", args, object_inputs)?;
+        let signed_tx = self.build_execute_function_tx(
+            StorageModule::function_names().buy_storage,
+            args,
+            object_inputs,
+        )?;
         self.submit_transaction(signed_tx).await
     }
 }

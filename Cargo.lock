@@ -3905,6 +3905,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "mika-core"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bcs",
+ "fjall",
+ "hex",
+ "kanari-common",
+ "kanari-core",
+ "kanari-crypto",
+ "kanari-rpc-api",
+ "kanari-rpc-client",
+ "kanari-types",
+ "mika-types",
+ "move-core-types",
+ "proptest",
+ "rand 0.10.3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "mika-node"
 version = "0.0.1"
 dependencies = [
@@ -3956,25 +3983,29 @@ dependencies = [
 name = "mika-storage"
 version = "0.0.1"
 dependencies = [
+ "fjall",
+ "mika-core",
+ "mika-types",
+ "proptest",
+ "rand 0.10.3",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "mika-types"
+version = "0.0.1"
+dependencies = [
  "anyhow",
  "async-trait",
  "bcs",
- "fjall",
  "hex",
- "kanari-common",
- "kanari-core",
  "kanari-crypto",
- "kanari-rpc-api",
- "kanari-rpc-client",
  "kanari-types",
- "proptest",
- "rand 0.10.3",
- "reqwest",
+ "move-core-types",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]

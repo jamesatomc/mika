@@ -5,14 +5,14 @@
 //! the slivers. Slivers are persisted in an on-disk fjall key-value store so
 //! uploads survive across separate CLI invocations.
 
-use crate::blob::{Blob, BlobID};
 use crate::certificate::{WriteCertificate, WriteCertificateQuorum};
-use crate::epoch::{Lease, current_epoch};
 use crate::erasure::{ErasureParams, decode, encode, rejoin_shards, split_into_shards};
-use crate::error::{MikaStorageError, Result};
-use crate::sliver::Sliver;
 use async_trait::async_trait;
 use fjall::{Database, Keyspace};
+use mika_types::blob::{Blob, BlobID};
+use mika_types::epoch::{Lease, current_epoch};
+use mika_types::error::{MikaStorageError, Result};
+use mika_types::sliver::Sliver;
 use std::path::PathBuf;
 
 /// Address of a storage node (host:port).
@@ -248,7 +248,7 @@ impl MikaClient {
         }
 
         // Lease TTL is epoch-driven (Walrus): fee buys whole epochs.
-        let lease = Lease::new_for_epochs(blob.id, crate::epoch::epochs_for_fee(fee), fee);
+        let lease = Lease::new_for_epochs(blob.id, mika_types::epoch::epochs_for_fee(fee), fee);
         Ok((quorum, lease))
     }
 

@@ -15,6 +15,8 @@ exclude = [
 # Members List: Crates that are part of this workspace.
 # These are the core components of the "kanari-" project.
 members = [
+      "crates/mika-types",
+      "crates/mika-core",
       "crates/mika-storage",
       "crates/mika-node",
       "crates/mika-cli",
@@ -72,6 +74,8 @@ libp2p-tcp = { version = "0.45.0", features = ["tokio"] }
 libp2p-yamux = "0.48.0"
 
 # Internal workspace crates
+mika-types = { path = "crates/mika-types" }
+mika-core = { path = "crates/mika-core" }
 mika-storage = { path = "crates/mika-storage" }
 mika-server = { path = "crates/mika-server" }
 mika-node = { path = "crates/mika-node" }
@@ -82,6 +86,7 @@ mika-node = { path = "crates/mika-node" }
 # ============================================================================
 kanari-crypto = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
 kanari-types = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
+move-core-types = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
 kanari-core = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
 kanari-rpc-client = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }
 kanari-rpc-api = { git = "https://github.com/kanari-network/kanari-sdk", tag = "v0.3.9-alpha" }

@@ -4,11 +4,11 @@
 //! served (read) a sliver. These are anchored on-chain to prove data
 //! availability and to authorize ownership transfers.
 
-use crate::blob::BlobID;
-use crate::error::{MikaStorageError, Result};
 use kanari_crypto::CurveType;
 use kanari_crypto::hash_data_blake3_array;
 use kanari_crypto::signatures::{sign_message, verify_signature_with_curve};
+use mika_types::blob::BlobID;
+use mika_types::error::{MikaStorageError, Result};
 use serde::{Deserialize, Serialize};
 
 /// A storage node's attestation that it has stored a given sliver.
@@ -17,7 +17,7 @@ pub struct WriteCertificate {
     pub blob_id: BlobID,
     pub shard_index: u32,
     pub node_id: String,
-    pub epoch: crate::epoch::Epoch,
+    pub epoch: mika_types::epoch::Epoch,
     pub sliver_hash: [u8; 32],
     pub signature: Vec<u8>,
     pub public_key: String,

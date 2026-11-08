@@ -6,9 +6,9 @@
 //! roots + parity roots into a blob commitment, so any single sliver can
 //! be verified against the on-chain commitment without the whole blob.
 
-use crate::blob::BlobID;
 use crate::erasure::{ErasureParams, encode, split_into_shards};
 use kanari_crypto::hash_data_blake3_array;
+use mika_types::blob::BlobID;
 
 /// 2D commitment for `data` encoded with `params`: row roots over the
 /// `k` data shards, then a root over row+parity roots, mixed with the
@@ -66,7 +66,7 @@ pub fn verify_shard(
 }
 
 /// BlobID ↔ commitment helper for tests: commitment changes if data changes.
-pub fn commitment_for_blob(blob: &crate::blob::Blob) -> [u8; 32] {
+pub fn commitment_for_blob(blob: &mika_types::blob::Blob) -> [u8; 32] {
     BlobID::from_content(&blob.data).0
 }
 
