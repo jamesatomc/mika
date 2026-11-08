@@ -7,7 +7,7 @@ use mika_storage::blob::BlobID;
 use mika_storage::epoch::current_epoch;
 use mika_storage::erasure::ErasureParams;
 use mika_storage::kanari_integration::KanariStorage;
-use mika_storage::onchain::{BlobAnchor, StorageFeePayment};
+use mika_storage::onchain::BlobAnchor;
 use mika_storage::{Blob, MikaClient, NodeAddr, StorageClient, StoragePayment};
 use serde_json::json;
 use std::path::PathBuf;
@@ -180,46 +180,43 @@ async fn main() -> Result<()> {
                 nodes.into_iter().map(NodeAddr::new).collect()
             };
 
-            // Walrus flow (1/3): PAY FIRST on-chain (storage quota) before
-            // storing any sliver — fee > 0 requires --password (+ object id).
-            let kanari = if fee > 0 {
+            // Walrus order for this contract is: STORE → CERTIFY (anchor with
+            // fee_paid). `pay_storage_rent` requires the anchor to exist
+            // (it does `find_anchor_index`), so paying first aborts
+            // (COMMITTED/FAILED on explorer). The fee is recorded by the
+            // anchor itself (`fee_paid`), so no separate pay Tx is needed
+            // for a first upload. `pay_storage_rent` remains for renewals
+            // (top-up fee_paid after the anchor exists).
+            let kanari = if !no_anchor {
                 let pwd = password.as_deref().context(
-                    "Walrus-style upload requires --password (fee > 0, paid before storing)",
+                    "Walrus-style certify requires --password (anchor needs the signer)",
                 )?;
                 let mut kv = KanariStorage::from_config(pwd, "cli-node")?;
                 if let Some(id) = storage_object_id.as_deref() {
                     kv = kv.with_storage_object_id(id);
                 } else {
-                    anyhow::bail!("Walrus-style upload requires --storage-object-id (fee > 0)");
+                    anyhow::bail!("Walrus-style certify requires --storage-object-id");
                 }
-                let payer = kanari_types::address::Address::from_hex_literal(kv.address())
-                    .with_context(|| format!("invalid payer address: {}", kv.address()))?;
-                let payment = StorageFeePayment {
-                    blob_id: blob.id,
-                    payer,
-                    amount: fee,
-                    epoch: current_epoch(),
-                };
-                kv.pay_storage_rent(&payment).await
-                    .with_context(|| "pay_storage_rent failed")?;
-                println!("Paid storage rent on-chain: {} mist (epoch {})", fee, payment.epoch);
                 Some(kv)
             } else {
-                // fee == 0 → local/dev upload only, no chain interaction
+                // --no-anchor → local/dev upload only, no chain interaction
                 None
             };
 
-            // (2/3): STORE slivers + collect write certificates.
+            // (1/2): STORE slivers + collect write certificates.
             let client = MikaClient::with_store_path(node_addrs.clone(), "./mika-store");
             let (quorum, lease) = client.put_blob(&blob, &params, fee).await?;
 
-            // (3/3): CERTIFY on-chain — anchor blob commitment with owner.
-            // Walrus only certifies after the quorum exists; the anchor must
-            // not precede the stored slivers.
+            // (2/2): CERTIFY on-chain — anchor blob commitment with owner
+            // (records `fee_paid = fee` on-chain at upload time — this is
+            // the "pay on upload" step for Walrus-style certify).
             if !no_anchor {
                 if let Some(kv) = kanari.as_ref() {
                     // Commitment = blob_id (blake3 content root, 32 bytes).
-                    let commitment: [u8; 32] = blob.id.as_bytes().try_into()
+                    let commitment: [u8; 32] = blob
+                        .id
+                        .as_bytes()
+                        .try_into()
                         .map_err(|_| anyhow::anyhow!("blob id must be 32 bytes"))?;
                     let owner = kanari_types::address::Address::from_hex_literal(kv.address())
                         .with_context(|| format!("invalid owner address: {}", kv.address()))?;
@@ -231,7 +228,10 @@ async fn main() -> Result<()> {
                         fee_paid: fee,
                     };
                     match kv.anchor_blob(&anchor).await {
-                        Ok(()) => println!("Blob certified on-chain (anchor_blob)"),
+                        Ok(()) => {
+                            println!("Paid + certified on-chain: {} mist", fee);
+                            println!("  anchor_blob (certify) committed");
+                        }
                         Err(e) => {
                             eprintln!("Warning: anchor_blob after quorum failed: {e}");
                             // Do not delete stored slivers — blob is retrievable

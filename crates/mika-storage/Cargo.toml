@@ -22,6 +22,8 @@ kanari-types = { workspace = true }
 kanari-crypto = { workspace = true }
 kanari-core = { workspace = true, optional = true }
 kanari-common = { workspace = true, optional = true }
+kanari-rpc-client = { workspace = true, optional = true }
+kanari-rpc-api = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 async-trait = { workspace = true }
 fjall = { workspace = true }
@@ -33,4 +35,4 @@ rand = { workspace = true }
 
 [features]
 default = []
-onchain = ["kanari-core", "kanari-common"]
+onchain = ["kanari-core", "kanari-common", "kanari-rpc-client", "kanari-rpc-api"]

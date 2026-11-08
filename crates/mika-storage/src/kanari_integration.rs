@@ -14,14 +14,10 @@ use crate::certificate::{WriteCertificate, WriteCertificateQuorum};
 use crate::error::{MikaStorageError, Result};
 use crate::onchain::{BlobAnchor, StorageFeePayment, StoragePayment};
 use bcs::to_bytes as bcs_to_bytes;
-use hex::encode as hex_encode;
 use kanari_common::{get_active_address, load_kanari_config};
 use kanari_core::BlockchainEngine;
-use kanari_crypto::keystore::Keystore;
-use kanari_crypto::{
-    encryption::decrypt_data,
-    keys::{CurveType, keypair_from_private_key},
-};
+use kanari_crypto::keys::{CurveType, keypair_from_private_key};
+use kanari_rpc_client::RpcClient;
 use kanari_types::address::Address as KanariAddress;
 use kanari_types::transaction::{
     GasPayment, ObjectInput, ObjectOwnerKind, ObjectRef, SignedTransaction, Transaction,
@@ -30,9 +26,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Mika Move module address (where the storage contract is deployed).
-const MIKA_MODULE_ADDRESS: &str = "0x3ba63b92aac5f2bff87e580e820b61faf1c5fe9ae12f0bc8addd931a340b3146";
-/// Mika Move module name.
-const MIKA_MODULE_NAME: &str = "mika::storage";
+const MIKA_MODULE_ADDRESS: &str =
+    "0x3ba63b92aac5f2bff87e580e820b61faf1c5fe9ae12f0bc8addd931a340b3146";
+/// Mika Move module name (the module *inside* package `mika`).
+const MIKA_MODULE_NAME: &str = "storage";
 
 /// A Mika storage node integrated with the kanari-sdk blockchain.
 ///
@@ -41,6 +38,11 @@ const MIKA_MODULE_NAME: &str = "mika::storage";
 /// config file / keystore for storage certificates.
 pub struct KanariStorage {
     engine: Arc<RwLock<BlockchainEngine>>,
+    /// RPC URL of the running Kanari node (`get_active_rpc`), for submitting
+    /// transactions to the real network (visible in explorer) instead of the
+    /// in-memory engine.
+    rpc: Option<RpcClient>,
+    rpc_url: Option<String>,
     private_key: String,
     #[allow(dead_code)]
     public_key: String,
@@ -68,29 +70,19 @@ impl KanariStorage {
             MikaStorageError::Crypto("no active address found in kanari config".into())
         })?;
 
-        // Resolve keystore path from config
-        let keystore_path = kanari_common::get_kanari_config_path();
-
-        // Load keystore
-        let keystore = Keystore::load_from_path(&keystore_path)
+        // The keystore stores an encrypted *Wallet* (TOML, compressed) — not a
+        // raw private key. `decrypt_data` alone returns the compressed TOML,
+        // which hex-encoding + keypair_from_private_key cannot parse
+        // ("Invalid private key format"). `load_wallet` does the full
+        // decrypt → decompress → TOML parse.
+        let wallet = kanari_crypto::load_wallet(&active_address, password)
             .map_err(|e| MikaStorageError::Crypto(e.to_string()))?;
 
-        // Get encrypted data for the active address
-        let encrypted = keystore.get_wallet(&active_address).ok_or_else(|| {
-            MikaStorageError::Crypto(format!(
-                "no keystore entry for active address {}",
-                active_address
-            ))
-        })?;
+        let private_key_hex = wallet.private_key.to_string();
+        let curve_type = wallet.curve_type;
 
-        // Decrypt the private key
-        let plaintext = decrypt_data(encrypted, password)
-            .map_err(|e| MikaStorageError::Crypto(e.to_string()))?;
-
-        let private_key_hex = hex_encode(&plaintext);
-
-        // Derive public key from private key
-        let keypair = keypair_from_private_key(&private_key_hex, CurveType::K256)
+        // Derive public key from private key (validates format)
+        let keypair = keypair_from_private_key(&private_key_hex, curve_type)
             .map_err(|e| MikaStorageError::Crypto(e.to_string()))?;
 
         let engine = BlockchainEngine::new_in_memory()
@@ -98,10 +90,15 @@ impl KanariStorage {
 
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
-            private_key: private_key_hex,
+            rpc: kanari_common::get_active_rpc().map(|u| {
+                eprintln!("mika: submitting on-chain via RPC {u}");
+                RpcClient::new(u)
+            }),
+            rpc_url: kanari_common::get_active_rpc(),
+            private_key: private_key_hex.to_string(),
             public_key: keypair.public_key,
             address: active_address,
-            curve_type: CurveType::K256,
+            curve_type,
             node_id: node_id.into(),
             storage_object_id: None,
         })
@@ -119,6 +116,8 @@ impl KanariStorage {
             .map_err(|e| MikaStorageError::Crypto(e.to_string()))?;
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
+            rpc: None,
+            rpc_url: None,
             private_key: private_key_hex.to_string(),
             public_key: keypair.public_key,
             address: keypair.address,
@@ -183,13 +182,15 @@ impl KanariStorage {
         args: Vec<Vec<u8>>,
         object_inputs: Vec<ObjectInput>,
     ) -> Result<SignedTransaction> {
-        let sender = self.address.clone();
+        // RPC verification requires tagged sender: `CurveType:public_key`
+        // (ko `kanari move` uses `get_sender_for_tx` for the same reason).
+        let sender = format!("{}:{}", self.curve_type, self.public_key);
         let module = format!("{}::{}", MIKA_MODULE_ADDRESS, MIKA_MODULE_NAME);
 
         let gas_payment = Some(GasPayment {
             payment_objects: vec![],
             owner: self.address.clone(),
-            budget: 1_000_000_000,
+            budget: 10_000_000,
             price: 1000,
             coin_type: None,
             price_version: None,
@@ -203,7 +204,7 @@ impl KanariStorage {
             args,
             object_inputs,
             gas_payment,
-            gas_limit: 1_000_000_000,
+            gas_limit: 10_000_000,
             gas_price: 1000,
             nonce: 0,
         };
@@ -216,22 +217,124 @@ impl KanariStorage {
         Ok(signed_tx)
     }
 
-    /// Submit a signed transaction via BlockchainEngine.
-    /// Submits to mempool, then produces an owned fast checkpoint.
-    async fn submit_transaction(&self, signed_tx: SignedTransaction) -> Result<()> {
-        let engine = self.engine.read().await;
+    /// Submit a signed transaction. When an RPC URL is configured
+    /// (`get_active_rpc`), submit to the **running node** via
+    /// `call_function` (visible in explorer); otherwise fall back to the
+    /// in-memory engine (local/dev only, invisible on explorer).
+    async fn submit_transaction(&self, signed_tx: SignedTransaction) -> Result<String> {
+        if let Some(rpc) = &self.rpc {
+            // Build the request on the node first (nonce/gas chosen by node).
+            // Submitting a nonce-0 request fails: "Prepared request nonce
+            // must be non-zero" — the node rejects zeros, so we must build
+            // then sign the *built* request (same as `kanari move` CLI).
+            let Transaction::ExecuteFunction {
+                sender,
+                module,
+                function,
+                type_args,
+                args,
+                mut object_inputs,
+                gas_payment,
+                gas_limit,
+                gas_price,
+                nonce: _,
+            } = signed_tx.transaction.clone()
+            else {
+                return Err(MikaStorageError::OnChain(
+                    "expected ExecuteFunction transaction for RPC submit".into(),
+                ));
+            };
+            // Node requires (object_id, version, digest) for object inputs.
+            for input in &mut object_inputs {
+                if input.object_ref.version.is_none() || input.object_ref.digest.is_none() {
+                    let info = rpc
+                        .get_object(&input.object_ref.object_id)
+                        .await
+                        .map_err(|e| {
+                            MikaStorageError::OnChain(format!(
+                                "get_object {}: {e}",
+                                input.object_ref.object_id
+                            ))
+                        })?;
+                    input.object_ref.version = Some(info.version);
+                    input.object_ref.digest = info.digest;
+                }
+            }
+            let (package, module_name) = module.split_once("::").unwrap_or((&module, ""));
+            let build_req = kanari_rpc_api::requests::BuildCallFunctionRequest {
+                sender: sender.clone(),
+                package: package.to_string(),
+                module: module_name.to_string(),
+                function: function.clone(),
+                type_args: type_args.clone(),
+                args: args.clone(),
+                object_inputs: if object_inputs.is_empty() {
+                    None
+                } else {
+                    Some(object_inputs.clone())
+                },
+                gas_limit,
+                gas_price,
+                nonce: None,
+                execute_immediate: None,
+            };
+            let mut built = rpc
+                .build_call_function(build_req)
+                .await
+                .map_err(|e| MikaStorageError::OnChain(format!("RPC build_call_function: {e}")))?;
+            // Sign the built request (same Transaction shape as `kanari move`).
+            let tx_for_sign = Transaction::ExecuteFunction {
+                sender: built.sender.clone(),
+                module: format!("{}::{}", built.package, built.module),
+                function: built.function.clone(),
+                type_args: built.type_args.clone(),
+                args: built.args.clone(),
+                object_inputs: built.object_inputs.clone().unwrap_or_default(),
+                gas_payment: built.gas_payment.clone(),
+                gas_limit: built.gas_limit,
+                gas_price: built.gas_price,
+                nonce: built
+                    .canonical_nonce()
+                    .map_err(|e| MikaStorageError::OnChain(format!("invalid built nonce: {e}")))?,
+            };
+            let mut sig_tx = SignedTransaction::new(tx_for_sign);
+            sig_tx
+                .sign(&self.private_key, self.curve_type)
+                .map_err(|e| MikaStorageError::Crypto(e.to_string()))?;
+            built.signature = Some(sig_tx.signature.clone());
+            // Keep the locally-built gas payment if node left it unset.
+            if built.gas_payment.is_none() {
+                let _ = gas_payment; // built already carries it
+            }
+            let _ = signed_tx; // original nonce-0 signatures discarded (mismatched)
+            let status = rpc
+                .call_function(built)
+                .await
+                .map_err(|e| MikaStorageError::OnChain(format!("RPC call_function: {e}")))?;
+            if !status.success {
+                return Err(MikaStorageError::OnChain(format!(
+                    "tx {} failed: {}",
+                    status.hash, status.status
+                )));
+            }
+            eprintln!(
+                "mika: tx {} submitted via RPC {} (status {})",
+                status.hash,
+                self.rpc_url.as_deref().unwrap_or("?"),
+                status.status
+            );
+            return Ok(status.hash);
+        }
 
-        // Submit to mempool
+        let engine = self.engine.read().await;
         engine
             .submit_transactions_batch(vec![signed_tx])
             .map_err(|e| MikaStorageError::OnChain(e.to_string()))?;
-
-        // Produce checkpoint to execute the transaction
         engine
             .produce_owned_fast_checkpoint()
             .map_err(|e| MikaStorageError::OnChain(e.to_string()))?;
-
-        Ok(())
+        // In-memory engine has no hash to report.
+        Ok(String::new())
     }
 }
 
@@ -244,12 +347,18 @@ impl StoragePayment for KanariStorage {
             )
         })?;
 
-        // Args: blob_id (vector<u8>), amount (u64)
+        // Move: pay_storage_rent(storage_id: address, blob_id: address,
+        //                         amount: u64, payer: address)
+        // `address` args are raw 32 bytes (not BCS Vec<u8> with length prefix).
+        // `storage_id` must be the FIRST arg (plus object input for borrow).
+        let storage_addr = KanariAddress::from_hex_literal(storage_id)
+            .map_err(|e| MikaStorageError::OnChain(format!("bad storage id {storage_id}: {e}")))?;
         let args = vec![
-            bcs_to_bytes(&payment.blob_id.as_bytes().to_vec())
-                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            storage_addr.to_bytes().to_vec(),
+            payment.blob_id.as_bytes().to_vec(),
             bcs_to_bytes(&payment.amount)
                 .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            payment.payer.to_bytes().to_vec(),
         ];
 
         // Object input: Storage object (mutable)
@@ -259,13 +368,14 @@ impl StoragePayment for KanariStorage {
                 version: None,
                 digest: None,
             },
-            owner: Some(ObjectOwnerKind::AddressOwner(self.address.clone())),
+            owner: Some(ObjectOwnerKind::Shared),
             mutable: true,
         }];
 
         let signed_tx = self.build_execute_function_tx("pay_storage_rent", args, object_inputs)?;
 
-        self.submit_transaction(signed_tx).await
+        self.submit_transaction(signed_tx).await?;
+        Ok(())
     }
 
     async fn anchor_blob(&self, anchor: &BlobAnchor) -> Result<()> {
@@ -275,11 +385,14 @@ impl StoragePayment for KanariStorage {
             )
         })?;
 
-        // Args: blob_id (vector<u8>), owner (address), commitment (vector<u8>),
-        // epoch (u64), fee_paid (u64)
+        // Move: anchor_blob(storage_id: address, blob_id: address, owner: address,
+        //                         commitment: vector<u8>, epoch: u64, fee_paid: u64,
+        //                         ctx: &mut TxContext /* injected by node */)
+        let storage_addr = KanariAddress::from_hex_literal(storage_id)
+            .map_err(|e| MikaStorageError::OnChain(format!("bad storage id {storage_id}: {e}")))?;
         let args = vec![
-            bcs_to_bytes(&anchor.blob_id.as_bytes().to_vec())
-                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            storage_addr.to_bytes().to_vec(),
+            anchor.blob_id.as_bytes().to_vec(),
             anchor.owner.to_bytes().to_vec(),
             bcs_to_bytes(&anchor.commitment.to_vec())
                 .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
@@ -296,13 +409,14 @@ impl StoragePayment for KanariStorage {
                 version: None,
                 digest: None,
             },
-            owner: Some(ObjectOwnerKind::AddressOwner(self.address.clone())),
+            owner: Some(ObjectOwnerKind::Shared),
             mutable: true,
         }];
 
         let signed_tx = self.build_execute_function_tx("anchor_blob", args, object_inputs)?;
 
-        self.submit_transaction(signed_tx).await
+        self.submit_transaction(signed_tx).await?;
+        Ok(())
     }
 
     async fn transfer_blob_ownership(
@@ -318,11 +432,13 @@ impl StoragePayment for KanariStorage {
             )
         })?;
 
-        // Args: blob_id (vector<u8>), from (address), to (address),
-        // rent_transfer_amount (u64)
+        // Move: transfer_blob_ownership(storage_id: address, blob_id: address,
+        // from: address, to: address, rent_transfer_amount: u64)
+        let storage_addr = KanariAddress::from_hex_literal(storage_id)
+            .map_err(|e| MikaStorageError::OnChain(format!("bad storage id {storage_id}: {e}")))?;
         let args = vec![
-            bcs_to_bytes(&blob_id.as_bytes().to_vec())
-                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?,
+            storage_addr.to_bytes().to_vec(),
+            blob_id.as_bytes().to_vec(),
             from.to_bytes().to_vec(),
             to.to_bytes().to_vec(),
             bcs_to_bytes(&rent_transfer_amount)
@@ -336,14 +452,15 @@ impl StoragePayment for KanariStorage {
                 version: None,
                 digest: None,
             },
-            owner: Some(ObjectOwnerKind::AddressOwner(self.address.clone())),
+            owner: Some(ObjectOwnerKind::Shared),
             mutable: true,
         }];
 
         let signed_tx =
             self.build_execute_function_tx("transfer_blob_ownership", args, object_inputs)?;
 
-        self.submit_transaction(signed_tx).await
+        self.submit_transaction(signed_tx).await?;
+        Ok(())
     }
 }
 
