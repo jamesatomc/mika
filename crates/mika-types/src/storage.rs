@@ -187,11 +187,13 @@ impl StorageModule {
     /// Deployed package address (the `mika` named address from Move.toml).
     pub const MODULE_ADDRESS: &'static str =
         "0x3ba63b92aac5f2bff87e580e820b61faf1c5fe9ae12f0bc8addd931a340b3146";
-    /// Full `address::module` string used by Node RPC `call_function`.
-    pub const MODULE_FULL_ID: &'static str =
-        "0x3ba63b92aac5f2bff87e580e820b61faf1c5fe9ae12f0bc8addd931a340b3146::storage";
 
-    /// Canonical `ModuleId` for `mika::storage`.
+    /// Canonical full `address::module` string for RPC `call_function`.
+    pub fn module_full_id() -> String {
+        format!("{}::{}", Self::MODULE_ADDRESS, Self::MODULE_NAME)
+    }
+
+    /// Canonical `ModuleId` for `mika::storage` (deployed package address).
     pub fn get_module_id() -> Result<ModuleId> {
         Self::get_module_id_for(Self::MODULE_ADDRESS)
     }

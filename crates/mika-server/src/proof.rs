@@ -1,8 +1,8 @@
 //! Storage proofs: a node proves it still holds a sliver by returning a
 //! BLAKE3 digest over the sliver bytes plus its shard index.
 
-use mika_storage::blob::BlobID;
-use mika_storage::error::Result;
+use mika_types::blob::BlobID;
+use mika_types::error::Result;
 use serde::{Deserialize, Serialize};
 
 /// A storage node's proof that it holds a given sliver at a given epoch.
@@ -38,7 +38,7 @@ impl StorageProof {
         let mut expected = [0u8; 32];
         expected.copy_from_slice(&digest);
         if expected != self.sliver_digest {
-            return Err(mika_storage::error::MikaStorageError::Crypto(
+            return Err(mika_types::error::MikaStorageError::Crypto(
                 "sliver digest mismatch in storage proof".into(),
             ));
         }

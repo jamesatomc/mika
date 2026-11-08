@@ -13,6 +13,8 @@ description.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+mika-types = { workspace = true }
+mika-core = { workspace = true }
 mika-storage = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

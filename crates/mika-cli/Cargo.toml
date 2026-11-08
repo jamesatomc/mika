@@ -12,6 +12,8 @@ repository.workspace = true
 description.workspace = true
 
 [dependencies]
+mika-types = { workspace = true }
+mika-core = { workspace = true }
 mika-storage = { workspace = true }
 mika-server = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

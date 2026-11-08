@@ -14,8 +14,8 @@ use axum::{
     response::Json,
     routing::{get, put},
 };
-use mika_storage::blob::BlobID;
-use mika_storage::sliver::Sliver;
+use mika_types::blob::BlobID;
+use mika_types::sliver::Sliver;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -128,8 +128,8 @@ pub fn routes() -> Router<SharedState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mika_storage::erasure::{ErasureParams, encode};
-    use mika_storage::sliver::Sliver;
+    use mika_core::erasure::{ErasureParams, encode};
+    use mika_types::sliver::Sliver;
     use std::sync::Arc;
     use tempfile::tempdir;
 

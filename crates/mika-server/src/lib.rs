@@ -36,7 +36,7 @@ impl AppState {
     }
 
     /// Publish a sliver announcement (no-op when P2P is disabled).
-    pub fn announce_sliver(&self, blob_id: &mika_storage::blob::BlobID, shard_index: u32) {
+    pub fn announce_sliver(&self, blob_id: &mika_types::blob::BlobID, shard_index: u32) {
         if let Ok(mut guard) = self.p2p.lock()
             && let Some(p) = guard.as_mut()
         {

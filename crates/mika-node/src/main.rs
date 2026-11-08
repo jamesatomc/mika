@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = cli.listen_addr.parse()?;
 
     let store = SliverStore::new(PathBuf::from(cli.data_dir.clone()))?;
-    let epoch = mika_storage::epoch::current_epoch();
+    let epoch = mika_types::epoch::current_epoch();
     let state: SharedState = Arc::new(AppState::new(cli.node_id.clone(), store, epoch));
 
     // libp2p control plane (same transport/behaviour as kanari-node::p2p):

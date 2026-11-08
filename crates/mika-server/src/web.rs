@@ -12,9 +12,9 @@ use axum::{
     routing::{get, post},
 };
 use kanari_crypto::hash_data_blake3_array;
-use mika_storage::blob::BlobID;
-use mika_storage::erasure::{ErasureParams, decode, encode, rejoin_shards, split_into_shards};
-use mika_storage::sliver::Sliver;
+use mika_types::blob::BlobID;
+use mika_core::erasure::{ErasureParams, decode, encode, rejoin_shards, split_into_shards};
+use mika_types::sliver::Sliver;
 use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
@@ -97,7 +97,7 @@ pub async fn upload_file(
 
     let params = ErasureParams::new(3, 2).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let blob = mika_storage::blob::Blob::new(data.clone());
+    let blob = mika_types::blob::Blob::new(data.clone());
     let shards = split_into_shards(&blob.data, params.data_shards)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let encoded = encode(&shards, &params).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -195,7 +195,7 @@ pub async fn get_proof(
         "blob_id": blob_id.to_hex(),
         "shard_index": shard_index,
         "node_id": state.node_id,
-        "epoch": mika_storage::epoch::current_epoch(),
+        "epoch": mika_types::epoch::current_epoch(),
         "sliver_digest": digest_hex,
         "sliver_size": sliver.data.len(),
         "original_len": sliver.original_len,

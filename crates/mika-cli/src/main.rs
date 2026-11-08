@@ -3,12 +3,12 @@ use clap::{Parser, Subcommand};
 use hex::encode as hex_encode;
 use mika_server::store::SliverStore;
 use mika_server::{AppState, SharedState};
-use mika_storage::blob::BlobID;
-use mika_storage::epoch::current_epoch;
-use mika_storage::erasure::ErasureParams;
-use mika_storage::kanari_integration::KanariStorage;
-use mika_storage::onchain::BlobAnchor;
-use mika_storage::{Blob, MikaClient, NodeAddr, StorageClient, StoragePayment};
+use mika_core::KanariStorage;
+use mika_core::{ErasureParams, MikaClient, NodeAddr, StorageClient};
+use mika_types::blob::BlobID;
+use mika_types::epoch::current_epoch;
+use mika_types::onchain::BlobAnchor;
+use mika_types::{Blob, StoragePayment};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -237,7 +237,17 @@ async fn main() -> Result<()> {
 
             // (1/2): STORE slivers + collect write certificates.
             let client = MikaClient::with_store_path(node_addrs.clone(), "./mika-store");
-            let (quorum, lease) = client.put_blob(&blob, &params, fee).await?;
+            let (mut quorum, lease) = client.put_blob(&blob, &params, fee).await?;
+            // Sign the quorum with the uploader's key (Walrus certify needs
+            // a real signature, not the placeholder from put_blob).
+            if let Some(kv) = kanari.as_ref() {
+                let _ = kv.sign_quorum(&mut quorum);
+                eprintln!(
+                    "  Signed quorum: {} certs ({} sig bytes total)",
+                    quorum.certificates.len(),
+                    quorum.certificates.iter().map(|c| c.signature.len()).sum::<usize>()
+                );
+            }
 
             // (2/2): CERTIFY on-chain — anchor blob commitment with owner
             // (records `fee_paid = fee` on-chain at upload time — this is
@@ -245,7 +255,7 @@ async fn main() -> Result<()> {
             if !no_anchor && let Some(kv) = kanari.as_ref() {
                 // 2D commitment (Walrus Red-Stuff style): verifiable per-sliver,
                 // not just the 1D blob hash.
-                let commitment = mika_storage::commitment::blob_commitment(&blob.data, &params);
+                let commitment = mika_core::commitment::blob_commitment(&blob.data, &params);
                 let owner = kanari_types::address::Address::from_hex_literal(kv.address())
                     .with_context(|| format!("invalid owner address: {}", kv.address()))?;
                 let anchor = BlobAnchor {

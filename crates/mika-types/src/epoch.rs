@@ -41,15 +41,6 @@ pub struct Lease {
 }
 
 impl Lease {
-    pub fn new(blob_id: crate::blob::BlobID, ttl_seconds: u64, fee_paid: u64) -> Self {
-        let expires_at = current_epoch() + ttl_seconds;
-        Self {
-            blob_id,
-            expires_at,
-            fee_paid,
-        }
-    }
-
     /// Walrus-style lease: `fee` buys whole epochs at `PRICE_PER_EPOCH`.
     pub fn new_for_epochs(blob_id: crate::blob::BlobID, epochs: u64, fee_paid: u64) -> Self {
         let epochs = epochs.max(1);
@@ -63,11 +54,6 @@ impl Lease {
 
     pub fn is_expired(&self, now: Epoch) -> bool {
         now >= self.expires_at
-    }
-
-    pub fn renew(&mut self, additional_seconds: u64, additional_fee: u64) {
-        self.expires_at += additional_seconds;
-        self.fee_paid += additional_fee;
     }
 
     /// Walrus-style renewal: buy `epochs` more epochs.
@@ -85,10 +71,10 @@ mod tests {
     #[test]
     fn lease_expiry() {
         let blob_id = crate::blob::BlobID::from_content(b"lease test");
-        let mut lease = Lease::new(blob_id, 100, 1000);
+        let mut lease = Lease::new_for_epochs(blob_id, 1, 1000);
         assert!(!lease.is_expired(current_epoch()));
-        lease.renew(200, 500);
-        assert_eq!(lease.fee_paid, 1500);
+        lease.renew_epochs(1);
+        assert_eq!(lease.fee_paid, 2000);
     }
 
     #[test]

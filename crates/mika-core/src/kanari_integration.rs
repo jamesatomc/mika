@@ -181,7 +181,12 @@ impl KanariStorage {
         // RPC verification requires tagged sender: `CurveType:public_key`
         // (ko `kanari move` uses `get_sender_for_tx` for the same reason).
         let sender = format!("{}:{}", self.curve_type, self.public_key);
-        let module = StorageModule::MODULE_FULL_ID.to_string();
+        // `address::module` from the 3 parts (no prejoined full-id constant).
+        let module = format!(
+            "{}::{}",
+            StorageModule::MODULE_ADDRESS,
+            StorageModule::MODULE_NAME
+        );
 
         let gas_payment = Some(GasPayment {
             payment_objects: vec![],
