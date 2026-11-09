@@ -774,12 +774,8 @@ fn resolve_mesh_map() -> Result<Vec<(String, String)>> {
         candidates.push(std::path::PathBuf::from(p));
     }
     candidates.push(std::path::PathBuf::from(".mesh"));
-    if let Ok(home) = std::env::var("MIKA_HOME") {
-        candidates.push(std::path::PathBuf::from(&home).join("mesh"));
-    } else if let Ok(home) = std::env::var("HOME") {
-        candidates.push(std::path::PathBuf::from(&home).join(".config/mika/mesh"));
-    } else if let Ok(home) = std::env::var("USERPROFILE") {
-        candidates.push(std::path::PathBuf::from(&home).join(".config/mika/mesh"));
+    if let Ok(p) = mika_common::mesh_map_path() {
+        candidates.push(p);
     }
     let mut content = None;
     for path in candidates {

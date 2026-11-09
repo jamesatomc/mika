@@ -38,20 +38,23 @@ Status of Mika against [Walrus](https://docs.wal.app) (Mysten Labs' decentralize
 mika-node --node-id n1 --data-dir ./d1 --p2p-listen 34001
 mika-node --node-id n2 --data-dir ./d2 --p2p-listen 34002 \
   --bootstrap /ip4/127.0.0.1/tcp/34001/p2p/<PEERID_n1>
+# or the 4-node helper: .\scripts\run-4nodes.ps1
 
 # 2. Upload to ONE entry peer (P2P spreads; --no-anchor skips on-chain)
-mika-cli upload --file myfile.txt \
-  --nodes /ip4/127.0.0.1/tcp/34001/p2p/<PEERID_n1> --no-anchor
-mika-cli download <BLOB_ID> --output out.txt \
-  --nodes /ip4/127.0.0.1/tcp/34001/p2p/<PEERID_n1>
+#    `-n 127.0.0.1:34001` resolves `host:port` via the mesh map (.mesh / MIKA_MESH_FILE / ~/.mika/mesh)
+mika-cli storage upload -f myfile.txt -n 127.0.0.1:34001 --no-anchor
+mika-cli storage download -o out.txt -n 127.0.0.1:34001 <BLOB_ID>
+mika-cli storage proof <BLOB_ID> 0 -n 127.0.0.1:34001
 
 # 3. On-chain (after `kanari move publish` of mika::storage + mika::committee):
-mika-cli committee join --committee-id <ID> --node-key <0x...> \
-  --password ...                                          # register a node key
-mika-cli buy --amount 100000 --password ... --storage-object-id <STORAGE_ID>
-mika-cli upload --file f --nodes <MULTIADDR> --fee 5000 \
-  --password ... --storage-object-id <ID> --committee-id <COMMITTEE_ID>
+mika-cli committee join --committee-id <ID> --node-key <0x...> -p ...   # register a node key
+mika-cli storage buy -a 100000 --storage-object-id <STORAGE_ID> -p ...
+mika-cli storage upload -f f -n 127.0.0.1:34001 --fee 5000 \
+  --storage-object-id <ID> --committee-id <COMMITTEE_ID> -p ...
 #   → anchor_blob then record_availability (PoA) automatically
+
+# 4. Start a node from the CLI itself (same as mika-node):
+mika-cli network start --node-id n1 --data-dir ./d1 --p2p-listen 34001
 ```
 
 ## Next verification TODO

@@ -1,0 +1,163 @@
+//! Network group handler (`network start`).
+
+use anyhow::Result;
+use mika_server::{AppState, SharedState};
+use mika_storage::store::SliverStore;
+use mika_types::epoch::current_epoch;
+use std::sync::Arc;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start(
+    node_id: String,
+    data_dir: std::path::PathBuf,
+    no_p2p: bool,
+    p2p_listen: u16,
+    bootstrap: Vec<String>,
+    committee_signers: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let committee_snapshot = if let Some(path) = &committee_signers {
+        let committee = mika_types::committee::load_committee_file(&path.to_string_lossy())?;
+        eprintln!(
+            "mika committee: {} member(s) from {}",
+            committee.len(),
+            path.display()
+        );
+        committee
+    } else {
+        Vec::new()
+    };
+    let store = SliverStore::new(data_dir.clone())?;
+    let epoch = current_epoch();
+    let mut app_state = AppState::new(node_id.clone(), store, epoch);
+    // Build the swarm first so announcements can carry our PeerId.
+    let p2p_ready = if !no_p2p {
+        use libp2p_identity::Keypair;
+        let keypair = Keypair::generate_ed25519();
+        let mut p2p = mika_server::p2p::MikaP2P::new(keypair, p2p_listen)?;
+        eprintln!("mika p2p: peer {}", p2p.peer_id);
+        for addr in p2p.swarm.listeners() {
+            eprintln!("mika p2p: multiaddr {}", addr);
+        }
+        p2p.dial_bootstrap(&bootstrap);
+        app_state.peer_id = p2p.peer_id.to_string();
+        Some(p2p)
+    } else {
+        None
+    };
+    app_state.committee = std::sync::Arc::new(committee_snapshot);
+    let state: SharedState = Arc::new(app_state);
+    if let Some(p2p) = p2p_ready {
+        *state.p2p.lock().unwrap() = Some(p2p);
+        let drive_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let fetched = {
+                    let mut guard = drive_state.p2p.lock().unwrap();
+                    let mut p2p = guard.take();
+                    let f = p2p
+                        .as_mut()
+                        .map(|p| p.drive_events(&drive_state))
+                        .unwrap_or_default();
+                    *guard = p2p;
+                    f
+                };
+                for sliver in &fetched {
+                    let _ = drive_state.store.put(sliver).await;
+                    drive_state.expiry.lock().unwrap().insert(
+                        sliver.blob_id.to_hex(),
+                        drive_state.epoch + mika_types::epoch::EPOCH_SECONDS,
+                    );
+                    eprintln!(
+                        "mika p2p: pulled sliver {}#{} into store",
+                        sliver.blob_id, sliver.shard_index
+                    );
+                }
+                for ann in drive_state.drain_pending() {
+                    if ann.node_id == drive_state.node_id || ann.peer_id.is_empty() {
+                        continue;
+                    }
+                    let Ok(blob_id) = mika_types::blob::BlobID::try_from(ann.blob_id.as_str())
+                    else {
+                        continue;
+                    };
+                    if drive_state.store.has(&blob_id, ann.shard_index).await {
+                        continue;
+                    }
+                    let mut guard = drive_state.p2p.lock().unwrap();
+                    if let Some(p) = guard.as_mut() {
+                        // Walrus-style routing: fetch from the shard's
+                        // assigned node when known, else the announcer.
+                        let assigned_peer = {
+                            let committee = drive_state.committee.clone();
+                            if committee.is_empty() {
+                                None
+                            } else {
+                                let mut sorted: Vec<_> = committee.iter().cloned().collect();
+                                sorted.sort_by_key(|a| a.to_string());
+                                let key = sorted[(ann.shard_index as usize) % sorted.len()]
+                                    .to_hex_literal();
+                                p.assigned_peer(&key).map(|peer| peer.to_string())
+                            }
+                        };
+                        p.send_fetch(
+                            assigned_peer.as_deref().unwrap_or(&ann.peer_id),
+                            ann.blob_id,
+                            ann.shard_index,
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        // BFT self-vote loop (mirror of mika-node).
+        let vote_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let blobs: Vec<_> = vote_state.store.list_blobs().await.unwrap_or_default();
+                for blob_id in blobs {
+                    let present = vote_state.store.shards_for_blob(&blob_id).await;
+                    if present.is_empty() {
+                        continue;
+                    }
+                    let root = mika_server::p2p::state_root_for(&present);
+                    let voter =
+                        mika_types::committee::node_key_for_public_key(&vote_state.public_key)
+                            .map(|v| v.into_bytes())
+                            .unwrap_or([0u8; 32]);
+                    let mut msg = Vec::new();
+                    msg.extend_from_slice(blob_id.to_hex().as_bytes());
+                    msg.extend_from_slice(&root);
+                    msg.extend_from_slice(&vote_state.epoch.to_le_bytes());
+                    msg.extend_from_slice(&voter);
+                    let digest = kanari_crypto::hash_data_blake3_array(&msg);
+                    let signature = kanari_crypto::signatures::sign_message(
+                        &vote_state.private_key,
+                        &digest,
+                        vote_state.curve_type,
+                    )
+                    .unwrap_or_default();
+                    let vote = mika_server::p2p::AvailabilityVote {
+                        blob_id: blob_id.to_hex(),
+                        state_root: root,
+                        epoch: vote_state.epoch,
+                        voter,
+                        public_key: vote_state.public_key.clone(),
+                        signature,
+                    };
+                    let mut guard = vote_state.p2p.lock().unwrap();
+                    if let Some(p) = guard.as_mut() {
+                        p.publish_vote(&vote);
+                    }
+                }
+            }
+        });
+    }
+    eprintln!(
+        "Starting Mika node {} (p2p: {})",
+        node_id,
+        if no_p2p { "disabled" } else { "enabled" }
+    );
+    eprintln!("  Data dir: {:?}", data_dir);
+    Ok(())
+}

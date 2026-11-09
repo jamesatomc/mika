@@ -323,7 +323,7 @@ module mika::storage {
     public fun reclaim_blob(
         storage_id: address,
         blob_id: address,
-        now_epoch: u64,
+        _now_epoch: u64,
         ctx: &mut TxContext
     ) {
         let storage = borrow::borrow_mut<Storage>(storage_id);

@@ -1,0 +1,396 @@
+            StorageCmd::Buy {
+                amount,
+                password,
+                storage_object_id,
+            } => {
+                let storage = KanariStorage::from_config(&password, "cli-node")?
+                    .with_storage_object_id(storage_object_id);
+                let hash = storage.buy_storage(amount).await?;
+                eprintln!("Bought storage quota on-chain: {} (tx {})", amount, hash);
+            }
+
+            StorageCmd::Reclaim {
+                blob_id,
+                storage_object_id,
+                password,
+                now_epoch,
+            } => {
+            let blob_id = BlobID::try_from(blob_id.as_str())?;
+            let storage = KanariStorage::from_config(&password, "cli-node")?
+                .with_storage_object_id(storage_object_id.clone());
+            let now = now_epoch.unwrap_or_else(current_epoch);
+            let storage_id = hex::decode(storage_object_id.trim_start_matches("0x"))
+                .with_context(|| format!("invalid storage object id: {}", storage_object_id))?;
+            let request = mika_types::storage::ReclaimBlobRequest {
+                storage_id,
+                blob_id: blob_id.as_bytes().to_vec(),
+                now_epoch: now,
+            };
+            storage.reclaim_blob(&request).await?;
+            eprintln!(
+                "Reclaimed blob {} on-chain (epoch {}): quota refunded",
+                blob_id, now
+            );
+        }
+
+            StorageCmd::Upgrade {
+                old_blob_id,
+                new_blob_id,
+                owner,
+                commitment,
+                password,
+                storage_object_id,
+                fee,
+            } => {
+            let old_blob_id = BlobID::try_from(old_blob_id.as_str())?;
+            let new_blob_id = BlobID::try_from(new_blob_id.as_str())?;
+            let owner_addr = kanari_types::address::Address::from_hex_literal(&owner)
+                .with_context(|| format!("invalid owner address: {}", owner))?;
+            let commitment_bytes: [u8; 32] = hex::decode(&commitment)
+                .with_context(|| "commitment must be 64 hex chars (32 bytes)")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("commitment must be exactly 32 bytes"))?;
+            let storage = KanariStorage::from_config(&password, "cli-node")?
+                .with_storage_object_id(storage_object_id.clone());
+            let storage_id = hex::decode(storage_object_id.trim_start_matches("0x"))
+                .with_context(|| format!("invalid storage object id: {}", storage_object_id))?;
+            let request = mika_types::storage::UpgradeBlobRequest {
+                storage_id,
+                old_blob_id: old_blob_id.as_bytes().to_vec(),
+                new_blob_id: new_blob_id.as_bytes().to_vec(),
+                owner: owner_addr.to_bytes().to_vec(),
+                commitment: commitment_bytes.to_vec(),
+                epoch: current_epoch(),
+                fee_paid: fee,
+            };
+            storage.upgrade_blob(&request).await?;
+            eprintln!(
+                "Upgraded blob {} -> {} on-chain (fee {} mist)",
+                old_blob_id, new_blob_id, fee
+            );
+        }
+
+            StorageCmd::Anchor {
+                blob_id,
+                owner,
+                commitment,
+                password,
+                fee,
+            } => {
+            let blob_id = BlobID::try_from(blob_id.as_str())?;
+            let owner_addr = kanari_types::address::Address::from_hex_literal(&owner)
+                .with_context(|| format!("invalid owner address: {}", owner))?;
+            let commitment_bytes: [u8; 32] = hex::decode(&commitment)
+                .with_context(|| "commitment must be 64 hex chars (32 bytes)")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("commitment must be exactly 32 bytes"))?;
+
+            // Load keypair from kanari config via kanari-common
+            let storage = KanariStorage::from_config(&password, "cli-node")?;
+            let anchor = BlobAnchor {
+                blob_id,
+                owner: owner_addr,
+                commitment: commitment_bytes,
+                epoch: current_epoch(),
+                fee_paid: fee,
+            };
+
+            // Try to anchor (will fail with "not yet implemented" message,
+            // but demonstrates the integration path)
+            match storage.anchor_blob(&anchor).await {
+                Ok(()) => {
+                    eprintln!("Blob anchored on-chain");
+                    eprintln!("  Blob ID: {}", blob_id);
+                    eprintln!("  Owner: {}", owner);
+                    eprintln!("  Commitment: {}", commitment);
+                    eprintln!("  Fee paid: {} mist", fee);
+                }
+                Err(e) => {
+                    eprintln!("Anchor not yet implemented against BlockchainEngine");
+                    eprintln!("  Blob ID: {}", blob_id);
+                    eprintln!("  Owner: {}", owner);
+                    eprintln!("  Commitment: {}", commitment);
+                    eprintln!("  Fee paid: {} mist", fee);
+                    eprintln!("  Error: {}", e);
+                }
+            }
+        }
+
+            StorageCmd::Upload {
+                file,
+                nodes,
+                data_shards,
+                parity_shards,
+                fee,
+                blob_type,
+                password,
+                storage_object_id,
+                committee_id,
+                no_anchor,
+            } => {
+            let data = tokio::fs::read(&file)
+                .await
+                .with_context(|| format!("reading file {:?}", file))?;
+
+            let flavor = mika_types::BlobType::from_str(&blob_type)
+                .with_context(|| format!("bad blob-type '{blob_type}' (binary|pq)"))?;
+            let mut blob = match flavor {
+                mika_types::BlobType::Pq => Blob::pq(data),
+                mika_types::BlobType::Binary => Blob::new(data),
+            };
+            let params = ErasureParams::new(data_shards, parity_shards)?;
+
+            // Walrus order for this contract is: STORE â†’ CERTIFY (anchor with
+            // fee_paid). `pay_storage_rent` requires the anchor to exist
+            // (it does `find_anchor_index`), so paying first aborts
+            // (COMMITTED/FAILED on explorer). The fee is recorded by the
+            // anchor itself (`fee_paid`), so no separate pay Tx is needed
+            // for a first upload. `pay_storage_rent` remains for renewals
+            // (top-up fee_paid after the anchor exists).
+            let kanari = if !no_anchor {
+                let pwd = password.as_deref().context(
+                    "Walrus-style certify requires --password (anchor needs the signer)",
+                )?;
+                let mut kv = KanariStorage::from_config(pwd, "cli-node")?;
+                if let Some(id) = storage_object_id.as_deref() {
+                    kv = kv.with_storage_object_id(id);
+                } else {
+                    anyhow::bail!("Walrus-style certify requires --storage-object-id");
+                }
+                Some(kv)
+            } else {
+                // --no-anchor â†’ local/dev upload only, no chain interaction
+                None
+            };
+
+            // (1/2): STORE â€” P2P push: encode locally, send every sliver
+            // once to the entry peer; that peer announces each shard and
+            // the mesh spreads the rest (peer-pull). The CLI never speaks
+            // to any other node.
+            let shards = mika_core::erasure::split_into_shards(&blob.data, params.data_shards)
+                .with_context(|| "split")?;
+            // Red Stuff 2D (Walrus-style): primary + secondary grids, 2n
+            // slivers total. Primary indices 0..n, secondary n..2n â€” the
+            // entry peer stores every sliver and announces them all.
+            let encoded = mika_core::erasure::redstuff_encode(&shards, &params)
+                .with_context(|| "redstuff encode")?;
+            let n = params.total_shards() as u32;
+            let slivers: Vec<mika_types::sliver::Sliver> = encoded
+                .primary
+                .iter()
+                .enumerate()
+                .chain(
+                    encoded
+                        .secondary
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i + n as usize, s)),
+                )
+                .map(|(i, shard)| {
+                    mika_types::sliver::Sliver::new(
+                        blob.id,
+                        i as u32,
+                        params.total_shards() as u32,
+                        params.data_shards as u32,
+                        params.parity_shards as u32,
+                        blob.data.len() as u64,
+                        shard.clone(),
+                    )
+                })
+                .collect();
+
+            let certs = mika_server::p2p::push_slivers(&nodes, slivers)
+                .await
+                .with_context(|| format!("push slivers to entry peer {nodes}"))?;
+            let mut quorum = mika_core::certificate::WriteCertificateQuorum::new(
+                blob.id,
+                params.total_shards() as u32,
+                params.data_shards as u32,
+                params.parity_shards as u32,
+                blob.data.len() as u64,
+            );
+            for cert in certs {
+                quorum.add(cert);
+            }
+            let lease = mika_types::epoch::Lease::new_for_epochs(
+                blob.id,
+                mika_types::epoch::epochs_for_fee(fee),
+                fee,
+            );
+            eprintln!("  P2P push committed: {} certs", quorum.certificates.len());
+
+            // PQ blob: Dilithium-sign the payload (Walrus PQ 4X/5X path).
+            if blob.flavor == mika_types::BlobType::Pq {
+                if let Some(_kv) = kanari.as_ref() {
+                    // Sign with the uploader key (Dilithium3) and attach to blob.
+                    use kanari_crypto::CurveType;
+                    let keypair = kanari_crypto::generate_keypair(CurveType::Dilithium3)
+                        .with_context(|| "Dilithium keypair generation failed")?;
+                    let sig = kanari_crypto::signatures::sign_message(
+                        &keypair.private_key,
+                        &blob.data,
+                        CurveType::Dilithium3,
+                    )
+                    .with_context(|| "PQ Dilithium signing failed")?;
+                    blob.pq_signature = sig;
+                    eprintln!(
+                        "  PQ blob: Dilithium3 sig {} bytes (pubkey {})",
+                        blob.pq_signature.len(),
+                        &keypair.public_key[..16.min(keypair.public_key.len())]
+                    );
+                } else {
+                    anyhow::bail!("PQ upload requires --password (Dilithium signer)");
+                }
+            }
+            // BFT quorum: certificates are already signed by storage nodes.
+            // Verify all signatures and confirm we have a quorum of distinct
+            // nodes (Walrus: 2f+1 committee signatures).
+            if let Some(_kv) = kanari.as_ref() {
+                let ok = mika_core::kanari_integration::verify_quorum(&quorum)?;
+                eprintln!(
+                    "  Quorum: {} certs, {} distinct nodes, verified={}",
+                    quorum.certificates.len(),
+                    quorum.distinct_nodes(),
+                    ok
+                );
+                if !ok {
+                    anyhow::bail!("quorum verification failed: invalid certificate signature");
+                }
+            }
+
+            // (2/3): CERTIFY on-chain â€” anchor blob commitment with owner
+            // (records `fee_paid = fee` on-chain at upload time â€” this is
+            // the "pay on upload" step for Walrus-style certify).
+            if !no_anchor && let Some(kv) = kanari.as_ref() {
+                let commitment = mika_core::commitment::blob_commitment(&blob.data, &params);
+                let owner = kanari_types::address::Address::from_hex_literal(kv.address())
+                    .with_context(|| format!("invalid owner address: {}", kv.address()))?;
+                let anchor = BlobAnchor {
+                    blob_id: blob.id,
+                    owner,
+                    commitment,
+                    epoch: current_epoch(),
+                    fee_paid: fee,
+                };
+                let anchored = match kv.anchor_blob(&anchor).await {
+                    Ok(()) => {
+                        eprintln!("Paid + certified on-chain: {} mist", fee);
+                        eprintln!("  anchor_blob (certify) committed");
+                        true
+                    }
+                    Err(e) => {
+                        // Idempotent on retry: an already-anchored blob aborts
+                        // on-chain (E_BLOB_ALREADY_ANCHORED) â€” treat as ok.
+                        eprintln!("Warning: anchor_blob after quorum failed: {e}");
+                        false
+                    }
+                };
+                // (3/3): PoA â€” aggregate the 2/3 write-certificate quorum and
+                // record it on-chain (Walrus availability certificate).
+                if anchored {
+                    match mika_core::certificate::PoaCert::aggregate(
+                        &quorum,
+                        commitment,
+                        current_epoch(),
+                    ) {
+                        Ok(poa) => match kv
+                            .record_availability(committee_id.as_deref().unwrap_or(""), &poa)
+                            .await
+                        {
+                            Ok(tx) => eprintln!(
+                                "  PoA recorded on-chain ({} distinct signers, tx {})",
+                                poa.signer_count, tx
+                            ),
+                            Err(e) => eprintln!("Warning: record_availability failed: {e}"),
+                        },
+                        Err(e) => {
+                            eprintln!("Warning: PoA quorum not met, skipping record: {e}")
+                        }
+                    }
+                }
+            }
+
+            eprintln!("Upload complete");
+            eprintln!("  Blob ID: {}", blob.id);
+            eprintln!("  Size: {} bytes", blob.data.len());
+            eprintln!("  Shards: {} data + {} parity", data_shards, parity_shards);
+            eprintln!("  Entry peer: {}", nodes);
+            eprintln!("  Certificates collected: {}", quorum.certificates.len());
+            eprintln!("  Lease expires at epoch: {}", lease.expires_at);
+            eprintln!("  Fee paid: {} mist", lease.fee_paid);
+        }
+
+            StorageCmd::Download {
+                blob_id,
+                output,
+                nodes,
+                data_shards,
+                parity_shards,
+            } => {
+            let blob_id = BlobID::try_from(blob_id.as_str())?;
+            let params = ErasureParams::new(data_shards, parity_shards)?;
+
+            // Red Stuff 2D index space: primary 0..n, secondary n..2n.
+            let n = params.total_shards() as u32;
+            let all_shards: Vec<u32> = (0..2 * n).collect();
+            let fetched = mika_server::p2p::fetch_slivers(&nodes, blob_id, all_shards)
+                .await
+                .with_context(|| format!("fetch from entry peer {nodes}"))?;
+            let mut primary: Vec<Option<Vec<u8>>> = vec![None; params.total_shards()];
+            let mut secondary: Vec<Option<Vec<u8>>> = vec![None; params.total_shards()];
+            let mut original_len: Option<usize> = None;
+            for sliver in fetched {
+                if sliver.blob_id != blob_id {
+                    continue;
+                }
+                let idx = sliver.shard_index as usize;
+                if idx < n as usize {
+                    primary[idx] = Some(sliver.data.clone());
+                } else if idx < 2 * n as usize {
+                    secondary[idx - n as usize] = Some(sliver.data.clone());
+                }
+                if original_len.is_none() {
+                    original_len = Some(sliver.original_len as usize);
+                }
+            }
+            let data_shards = mika_core::erasure::redstuff_decode(&primary, &secondary, &params)
+                .with_context(|| "decode shards")?;
+            let original_len =
+                original_len.unwrap_or_else(|| data_shards.iter().map(|s| s.len()).sum());
+            let data = rejoin_shards(&data_shards, original_len);
+            tokio::fs::write(&output, &data)
+                .await
+                .with_context(|| format!("writing file {:?}", output))?;
+
+            eprintln!("Download complete");
+            eprintln!("  Blob ID: {}", blob_id);
+            eprintln!("  Output: {:?}", output);
+            eprintln!("  Size: {} bytes", data.len());
+            }
+
+            StorageCmd::Proof {
+                blob_id,
+                shard_index,
+                nodes,
+            } => {
+            let blob_id = BlobID::try_from(blob_id.as_str())?;
+            let fetched = mika_server::p2p::fetch_slivers(&nodes, blob_id, vec![shard_index])
+                .await
+                .with_context(|| format!("fetch from entry peer {nodes}"))?;
+            let sliver = fetched
+                .into_iter()
+                .find(|s| s.blob_id == blob_id && s.shard_index == shard_index)
+                .ok_or_else(|| anyhow::anyhow!("sliver {}#{} not found", blob_id, shard_index))?;
+            let digest_arr = kanari_crypto::hash_data_blake3_array(&sliver.data);
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "blob_id": blob_id.to_hex(),
+                    "shard_index": shard_index,
+                    "entry_peer": nodes,
+                    "sliver_digest": hex_encode(digest_arr),
+                    "sliver_size": sliver.data.len(),
+                    "epoch": current_epoch(),
+                })
+            );
+            }

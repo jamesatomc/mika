@@ -3856,6 +3856,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mika-common"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
 name = "mika-core"
 version = "0.0.1"
 dependencies = [
@@ -3922,6 +3931,7 @@ dependencies = [
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-yamux",
+ "mika-common",
  "mika-core",
  "mika-storage",
  "mika-types",
