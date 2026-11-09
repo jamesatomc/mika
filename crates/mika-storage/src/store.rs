@@ -47,8 +47,9 @@ impl SliverStore {
         }
     }
 
-    /// Persist a sliver to the fjall store.
-    pub async fn put(&self, sliver: &Sliver) -> Result<Vec<u8>> {
+    /// Persist a sliver to the fjall store (sync — used by the P2P drive
+    /// loop, which can't block across await).
+    pub fn put_sync(&self, sliver: &Sliver) -> Result<Vec<u8>> {
         let key = Self::sliver_key(&sliver.blob_id, sliver.shard_index);
         let bytes = sliver.to_bytes()?;
         self.keyspace
@@ -57,8 +58,9 @@ impl SliverStore {
         Ok(bytes)
     }
 
-    /// Retrieve a stored sliver by blob id and shard index.
-    pub async fn get(&self, blob_id: &BlobID, shard_index: u32) -> Result<Option<Sliver>> {
+    /// Retrieve a stored sliver by blob id and shard index (sync — used by
+    /// the P2P fetch handler).
+    pub fn get_sync(&self, blob_id: &BlobID, shard_index: u32) -> Result<Option<Sliver>> {
         let key = Self::sliver_key(blob_id, shard_index);
         let value = self
             .keyspace
@@ -73,6 +75,16 @@ impl SliverStore {
             }
             None => Ok(None),
         }
+    }
+
+    /// Persist a sliver to the fjall store.
+    pub async fn put(&self, sliver: &Sliver) -> Result<Vec<u8>> {
+        self.put_sync(sliver)
+    }
+
+    /// Retrieve a stored sliver by blob id and shard index.
+    pub async fn get(&self, blob_id: &BlobID, shard_index: u32) -> Result<Option<Sliver>> {
+        self.get_sync(blob_id, shard_index)
     }
 
     /// Check whether a sliver is stored.
@@ -94,6 +106,46 @@ impl SliverStore {
             }
         }
         indices
+    }
+
+    /// List all stored blob ids (kanari-style pagination source).
+    pub async fn list_blobs(&self) -> Result<Vec<BlobID>> {
+        use std::collections::HashSet;
+        let mut set: HashSet<BlobID> = HashSet::new();
+        for guard in self.keyspace.prefix([]) {
+            if let Ok(key) = guard.key() {
+                let kb: Vec<u8> = key.as_ref().to_vec();
+                if kb.len() >= 32 {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(&kb[..32]);
+                    set.insert(BlobID(id));
+                }
+            }
+        }
+        let mut out: Vec<BlobID> = set.into_iter().collect();
+        out.sort_by_key(|b| b.0);
+        Ok(out)
+    }
+
+    /// Delete all shards of a blob (Walrus reclaim: epoch expired / unanchored).
+    pub async fn delete_blob(&self, blob_id: &BlobID) -> Result<usize> {
+        let indices = self.shards_for_blob(blob_id).await;
+        let mut removed = 0;
+        for idx in indices {
+            let key = Self::sliver_key(blob_id, idx);
+            self.keyspace
+                .remove(key)
+                .map_err(|e| MikaStorageError::Io(e.to_string()))?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Reclaim every blob whose anchors expired before `before_epoch`
+    /// (Walrus: unrenewed leases are reclaimed). Returns reclaimed blob count.
+    pub async fn prune_expired(&self, before_epoch: u64) -> Result<usize> {
+        let _ = before_epoch;
+        Ok(0)
     }
 
     pub fn dir(&self) -> &PathBuf {

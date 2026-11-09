@@ -57,18 +57,97 @@ impl TryFrom<&str> for BlobID {
     }
 }
 
+/// Blob flavor: binary (classic) or post-quantum (Dilithium-signed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BlobType {
+    #[default]
+    Binary,
+    Pq,
+}
+
+impl BlobType {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "pq" | "dilithium" | "post-quantum" => Ok(BlobType::Pq),
+            _ => Ok(BlobType::Binary),
+        }
+    }
+}
+
 /// A stored blob: its identifier and raw content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blob {
     pub id: BlobID,
     pub data: Vec<u8>,
+    /// Walrus-style flavor (binary / post-quantum).
+    #[serde(default)]
+    pub flavor: BlobType,
+    /// Dilithium signature over `data` for PQ blobs (empty for binary).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pq_signature: Vec<u8>,
 }
 
 impl Blob {
-    /// Create a new blob, computing its content-addressed ID.
+    /// Create a new blob (binary flavor), computing its content-addressed ID.
     pub fn new(data: Vec<u8>) -> Self {
         let id = BlobID::from_content(&data);
-        Self { id, data }
+        Self {
+            id,
+            data,
+            flavor: BlobType::Binary,
+            pq_signature: vec![],
+        }
+    }
+
+    /// Create a PQ-flavored blob (Dilithium-signed path).
+    pub fn pq(data: Vec<u8>) -> Self {
+        let id = BlobID::from_content(&data);
+        Self {
+            id,
+            data,
+            flavor: BlobType::Pq,
+            pq_signature: vec![],
+        }
+    }
+
+    /// Attach a Dilithium signature (from [`signatures::sign_message`]).
+    pub fn with_pq_signature(mut self, signature: Vec<u8>) -> Self {
+        self.pq_signature = signature;
+        self
+    }
+
+    /// Sign a PQ blob's data with a Dilithium keypair (Walrus PQ 4X/5X).
+    /// Binary blobs return `Ok(vec![])` (no signature).
+    pub fn sign_pq(
+        &self,
+        private_key_hex: &str,
+        curve: kanari_crypto::CurveType,
+    ) -> Result<Vec<u8>> {
+        if self.flavor != BlobType::Pq {
+            return Ok(vec![]);
+        }
+        kanari_crypto::signatures::sign_message(private_key_hex, &self.data, curve)
+            .map_err(|e| MikaStorageError::Crypto(e.to_string()))
+    }
+
+    /// Verify a PQ blob's Dilithium signature.
+    pub fn verify_pq(
+        &self,
+        signature: &[u8],
+        public_key_hex: &str,
+        curve: kanari_crypto::CurveType,
+    ) -> Result<bool> {
+        if self.flavor != BlobType::Pq {
+            return Ok(true);
+        }
+        kanari_crypto::signatures::verify_signature_with_curve(
+            public_key_hex,
+            &self.data,
+            signature,
+            curve,
+        )
+        .map_err(|e| MikaStorageError::Crypto(e.to_string()))
     }
 
     pub fn len(&self) -> usize {

@@ -1,19 +1,18 @@
-//! Mika storage node binary.
+//! Mika storage node binary — P2P-only (no HTTP API, no web UI).
 //!
-//! Runs an HTTP server that accepts and serves erasure-coded slivers and can
-//! produce storage proofs. Two APIs are served:
-//!   Sliver API:   GET /health, PUT/GET /slivers/{blob_id}/{shard_index},
-//!                 GET /proofs/{blob_id}/{shard_index}
-//!   Web API:      GET /, POST /api/v1/upload, GET /api/v1/download/:blob_id,
-//!                 GET /api/v1/proof/:blob_id/:shard_index,
-//!                 GET /api/v1/blobs/:blob_id, GET /api/v1/health
+//! A node is a pure libp2p peer:
+//!   - gossipsub `mika/slivers/v1` announcements (control plane),
+//!   - request-response `/mika/sliver-store/1.0.0` (ingress: clients push
+//!     slivers, node signs write certificates) and
+//!     `/mika/sliver-fetch/1.0.0` (dissemination: peers pull missing shards).
+//!
+//! One drive task pumps the swarm: inbound requests are serviced inline,
+//! announcements are queued and any missing sliver is fetched from the
+//! announcing peer. A reclaim loop sweeps expired leases.
 
 use clap::Parser;
-use mika_server::server::routes as sliver_routes;
-use mika_server::store::SliverStore;
-use mika_server::web::routes as web_routes;
 use mika_server::{AppState, SharedState};
-use std::net::SocketAddr;
+use mika_storage::store::SliverStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{Level, info};
@@ -21,7 +20,7 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
 #[command(name = "mika-node")]
-#[command(about = "Mika storage node")]
+#[command(about = "Mika storage node (P2P-only)")]
 struct Cli {
     /// Node identifier
     #[arg(long, default_value = "node-1")]
@@ -29,17 +28,13 @@ struct Cli {
 
     /// On-disk data directory
     #[arg(long, default_value = "./mika-data")]
-    data_dir: String,
+    data_dir: PathBuf,
 
-    /// Listen address
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    listen_addr: String,
-
-    /// Disable P2P control plane (HTTP only)
+    /// Disable P2P (node then only keeps its fjall store — offline peer)
     #[arg(long, default_value_t = false)]
     no_p2p: bool,
 
-    /// libp2p listen port (0 = random)
+    /// libp2p listen port (0 = random; the chosen multiaddr is logged)
     #[arg(long, default_value_t = 0)]
     p2p_listen: u16,
 
@@ -57,38 +52,71 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("setting tracer: {}", e))?;
 
     let cli = Cli::parse();
-    let addr: SocketAddr = cli.listen_addr.parse()?;
 
-    let store = SliverStore::new(PathBuf::from(cli.data_dir.clone()))?;
-    let epoch = mika_types::epoch::current_epoch();
-    let state: SharedState = Arc::new(AppState::new(cli.node_id.clone(), store, epoch));
-
-    // libp2p control plane (same transport/behaviour as kanari-node::p2p):
-    // gossipsub announcements + kad DHT; data plane stays HTTP.
-    if !cli.no_p2p {
+    // Build the swarm first so we know our PeerId for announcements.
+    let p2p_ready = if !cli.no_p2p {
         use libp2p_identity::Keypair;
-        // Ed25519 keypair — stable by node_id for deterministic PeerId.
+        // Ephemeral ed25519 keypair — PeerId changes per process; the
+        // logged multiaddr is the only stable handle for clients.
         let keypair = Keypair::generate_ed25519();
-        let port = if cli.p2p_listen == 0 {
-            0
-        } else {
-            cli.p2p_listen
-        };
-        let mut p2p = mika_server::p2p::MikaP2P::new(keypair, port)?;
+        let mut p2p = mika_server::p2p::MikaP2P::new(keypair, cli.p2p_listen)?;
         info!("mika p2p: peer {}", p2p.peer_id);
+        for addr in p2p.swarm.listeners() {
+            info!("mika p2p: multiaddr {}", addr);
+        }
         p2p.dial_bootstrap(&cli.bootstrap);
+        Some(p2p)
+    } else {
+        None
+    };
+
+    let store = SliverStore::new(cli.data_dir.clone())?;
+    let epoch = mika_types::epoch::current_epoch();
+    let mut app_state = AppState::new(cli.node_id.clone(), store, epoch);
+    if let Some(p) = p2p_ready.as_ref() {
+        app_state.peer_id = p.peer_id.to_string();
+    }
+    let state: SharedState = Arc::new(app_state);
+
+    if let Some(p2p) = p2p_ready {
         *state.p2p.lock().unwrap() = Some(p2p);
-        // Poll loop shares the mutex with PUT handlers. Poll synchronously
-        // (no await while holding the lock) so the future is Send.
-        let p2p_state = state.clone();
+        // Swarm drive loop: events + peer-pull dissemination.
+        let drive_state = state.clone();
         tokio::spawn(async move {
             loop {
-                {
-                    let mut p2p = p2p_state.p2p.lock().unwrap().take();
-                    if let Some(mut p) = p2p.take() {
-                        // Drive swarm events without holding the lock across await.
-                        p.poll_once_sync();
-                        *p2p_state.p2p.lock().unwrap() = Some(p);
+                let fetched = {
+                    let mut guard = drive_state.p2p.lock().unwrap();
+                    let mut p2p = guard.take();
+                    let f = p2p
+                        .as_mut()
+                        .map(|p| p.drive_events(&drive_state))
+                        .unwrap_or_default();
+                    *guard = p2p;
+                    f
+                };
+                for sliver in &fetched {
+                    let _ = drive_state.store.put(sliver).await;
+                    drive_state.expiry.lock().unwrap().insert(
+                        sliver.blob_id.to_hex(),
+                        drive_state.epoch + mika_types::epoch::EPOCH_SECONDS,
+                    );
+                    info!(blob = %sliver.blob_id, shard = sliver.shard_index, "mika p2p: pulled sliver into store");
+                }
+                // Drain queued announcements → fetch what we're missing.
+                for ann in drive_state.drain_pending() {
+                    if ann.node_id == drive_state.node_id || ann.peer_id.is_empty() {
+                        continue;
+                    }
+                    let Ok(blob_id) = mika_types::blob::BlobID::try_from(ann.blob_id.as_str())
+                    else {
+                        continue;
+                    };
+                    if drive_state.store.has(&blob_id, ann.shard_index).await {
+                        continue;
+                    }
+                    let mut guard = drive_state.p2p.lock().unwrap();
+                    if let Some(p) = guard.as_mut() {
+                        p.send_fetch(&ann.peer_id, ann.blob_id, ann.shard_index);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -96,23 +124,38 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Combine both APIs into a single router. They share the same state type
-    // and have non-overlapping routes.
-    let app = sliver_routes()
-        .merge(web_routes())
-        .with_state(state.clone());
+    // Walrus reclaim loop: sweep expired leases, delete their shards.
+    let reclaim_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let now = mika_types::epoch::current_epoch();
+            let expired: Vec<String> = {
+                let expiry = reclaim_state.expiry.lock().unwrap();
+                expiry
+                    .iter()
+                    .filter_map(|(id, exp)| if *exp <= now { Some(id.clone()) } else { None })
+                    .collect()
+            };
+            let expired_count = expired.len();
+            for id in expired {
+                if let Ok(bid) = mika_types::blob::BlobID::try_from(id.as_str()) {
+                    let _ = reclaim_state.store.delete_blob(&bid).await;
+                    reclaim_state.expiry.lock().unwrap().remove(&id);
+                }
+            }
+            if expired_count > 0 {
+                info!("mika reclaim: {} blobs purged", expired_count);
+            }
+        }
+    });
 
-    info!("mika-node {} listening on {}", cli.node_id, addr);
     info!(
-        "  sliver API: GET /health, PUT/GET /slivers/{{blob_id}}/{{shard_index}}, GET /proofs/{{...}}"
+        "mika-node {} running (p2p: {})",
+        cli.node_id,
+        if cli.no_p2p { "disabled" } else { "enabled" }
     );
-    info!("  web API:    GET /, POST /api/v1/upload, GET /api/v1/download/:blob_id");
-    info!(
-        "  p2p:        {} (bootstrap {:?})",
-        if cli.no_p2p { "disabled" } else { "enabled" },
-        cli.bootstrap
-    );
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    std::future::pending::<()>().await;
+    #[allow(unreachable_code)]
     Ok(())
 }

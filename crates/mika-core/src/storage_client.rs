@@ -1,10 +1,10 @@
-//! Client for uploading and downloading blobs to/from Mika storage nodes.
+//! Local erasure-code cache + blob assembly for Mika.
 //!
-//! The client erasure-codes a blob into slivers, distributes them to storage
-//! nodes, collects write certificates, and can later reassemble a blob from
-//! the slivers. Slivers are persisted in an on-disk fjall key-value store so
-//! uploads survive across separate CLI invocations.
+//! The mesh transport lives in `mika-server::p2p` (libp2p request-response);
+//! this crate only owns the pure data side: shard splitting/encoding, the
+//! fjall-backed local cache, and reassembly from fetched slivers.
 
+use crate::certificate::bft_threshold;
 use crate::certificate::{WriteCertificate, WriteCertificateQuorum};
 use crate::erasure::{ErasureParams, decode, encode, rejoin_shards, split_into_shards};
 use async_trait::async_trait;
@@ -13,10 +13,9 @@ use mika_types::blob::{Blob, BlobID};
 use mika_types::epoch::{Lease, current_epoch};
 use mika_types::error::{MikaStorageError, Result};
 use mika_types::sliver::Sliver;
-use serde::Deserialize;
 use std::path::PathBuf;
 
-/// Address of a storage node (host:port).
+/// Address of a storage node (host:port) — kept for the local cache key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeAddr(pub String);
 
@@ -40,14 +39,6 @@ pub struct StoreResult {
     pub blob_id: BlobID,
 }
 
-/// Response from `PUT /slivers/{blob_id}/{shard_index}` — node returns its
-/// signed write certificate for BFT quorum.
-#[derive(Deserialize)]
-pub struct PutSliverResponse {
-    pub ok: bool,
-    pub certificate: WriteCertificate,
-}
-
 /// Result of retrieving a sliver from a node.
 pub struct RetrieveResult {
     pub node_id: String,
@@ -55,41 +46,32 @@ pub struct RetrieveResult {
     pub data: Vec<u8>,
 }
 
-/// Asynchronous client interface to Mika storage nodes.
+/// Asynchronous client interface to Mika storage nodes (local cache side).
 #[async_trait]
 pub trait StorageClient: Send + Sync {
-    /// Store a sliver on a node and return a write certificate.
+    /// Store a sliver in the local cache.
     async fn store_sliver(&self, node: &NodeAddr, sliver: &Sliver) -> Result<StoreResult>;
-    /// Retrieve a sliver from a node.
+    /// Retrieve a sliver from the local cache.
     async fn retrieve_sliver(
         &self,
         node: &NodeAddr,
         blob_id: &BlobID,
         shard_index: u32,
     ) -> Result<RetrieveResult>;
-    /// Check whether a node holds a sliver.
+    /// Check whether a sliver is in the local cache.
     async fn has_sliver(&self, node: &NodeAddr, blob_id: &BlobID, shard_index: u32)
     -> Result<bool>;
 }
 
-/// Default fjall-backed client implementation.
-///
-/// Slivers are persisted in an on-disk fjall LSM-tree keyed by
-/// `blob_id (32 bytes) || shard_index (4 bytes LE)`.
-///
-/// **Walrus dissemination:** `put_blob` / `get_blob` / `store_sliver` also
-/// replicate over HTTP to the configured nodes (`PUT /slivers/...`,
-/// `GET /slivers/...`). Local fjall remains as cache/offline fallback so
-/// single-node dev and unit tests (fake `node-a:1234` hosts) keep working.
-/// Node URLs without a scheme default to `http://{host}:{port}`.
+/// Default fjall-backed client: local cache + erasure assembly. Sliver
+/// bytes travel over P2P (see `mika-server::p2p`); the mesh keeps copies
+/// in each node's own `SliverStore`.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct MikaClient {
     pub nodes: Vec<NodeAddr>,
     db: Database,
     keyspace: Keyspace,
-    #[cfg(feature = "onchain")]
-    http: reqwest::Client,
 }
 
 impl MikaClient {
@@ -99,6 +81,18 @@ impl MikaClient {
         let dir = tempfile::tempdir()
             .expect("failed to create temp dir")
             .into_path();
+        Self::from_dir(nodes, dir)
+    }
+
+    /// Create a client that persists its store to `path`, loading any existing
+    /// data so uploads and lookups survive across separate CLI invocations.
+    pub fn with_store_path(nodes: Vec<NodeAddr>, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let _ = std::fs::create_dir_all(&path);
+        Self::from_dir(nodes, path)
+    }
+
+    fn from_dir(nodes: Vec<NodeAddr>, dir: PathBuf) -> Self {
         let db = Database::builder(&dir)
             .open()
             .expect("failed to open fjall database");
@@ -109,90 +103,6 @@ impl MikaClient {
             nodes,
             db,
             keyspace,
-            #[cfg(feature = "onchain")]
-            http: reqwest::Client::new(),
-        }
-    }
-
-    /// Create a client that persists its store to `path`, loading any existing
-    /// data so uploads and lookups survive across separate CLI invocations.
-    pub fn with_store_path(nodes: Vec<NodeAddr>, path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let _ = std::fs::create_dir_all(&path);
-        let db = Database::builder(&path)
-            .open()
-            .expect("failed to open fjall database");
-        let keyspace = db
-            .keyspace("slivers", Default::default)
-            .expect("failed to open keyspace");
-        Self {
-            nodes,
-            db,
-            keyspace,
-            #[cfg(feature = "onchain")]
-            http: reqwest::Client::new(),
-        }
-    }
-
-    /// Normalize a node address to an HTTP base URL (`http://host:port`).
-    #[cfg(feature = "onchain")]
-    fn node_url(node: &NodeAddr) -> String {
-        let s = node.0.trim();
-        if s.starts_with("http://") || s.starts_with("https://") {
-            s.trim_end_matches('/').to_string()
-        } else {
-            format!("http://{s}")
-        }
-    }
-
-    /// Try `PUT /slivers/{blob_id}/{idx}` on the node. Returns the node's
-    /// signed write certificate on success, or None if the node is unreachable
-    /// (local cache only).
-    #[cfg(feature = "onchain")]
-    async fn http_put(&self, node: &NodeAddr, sliver: &Sliver) -> Result<Option<WriteCertificate>> {
-        let url = format!(
-            "{}/slivers/{}/{}",
-            Self::node_url(node),
-            sliver.blob_id.to_hex(),
-            sliver.shard_index
-        );
-        match self
-            .http
-            .put(&url)
-            .header("content-type", "application/octet-stream")
-            .body(sliver.data.clone())
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                let body: PutSliverResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
-                Ok(Some(body.certificate))
-            }
-            Ok(resp) => {
-                eprintln!("mika: PUT {url} -> {}", resp.status());
-                Ok(None)
-            }
-            Err(e) => {
-                eprintln!("mika: PUT {url} failed ({e}) — local cache only");
-                Ok(None)
-            }
-        }
-    }
-
-    #[cfg(feature = "onchain")]
-    async fn http_get(&self, node: &NodeAddr, blob_id: &BlobID, shard: u32) -> Option<Vec<u8>> {
-        let url = format!(
-            "{}/slivers/{}/{}",
-            Self::node_url(node),
-            blob_id.to_hex(),
-            shard
-        );
-        match self.http.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => resp.bytes().await.ok().map(|b| b.to_vec()),
-            _ => None,
         }
     }
 
@@ -204,7 +114,9 @@ impl MikaClient {
         key
     }
 
-    /// Erasure-code a blob and distribute its slivers across the configured nodes.
+    /// Erasure-code a blob and cache one sliver per node locally. Transport
+    /// is external (P2P push via `mika-server::p2p::push_slivers`); the
+    /// certificates collected there are what satisfy the BFT quorum.
     pub async fn put_blob(
         &self,
         blob: &Blob,
@@ -249,15 +161,7 @@ impl MikaClient {
             self.keyspace
                 .insert(key, bytes)
                 .map_err(|e| MikaStorageError::Io(e.to_string()))?;
-            // Walrus dissemination: replicate to the node's HTTP store and
-            // collect its signed write certificate for BFT quorum.
-            #[cfg(feature = "onchain")]
-            if let Ok(Some(cert)) = self.http_put(node, &sliver).await {
-                quorum.add(cert);
-                continue;
-            }
-            // Fallback: local/unsigned certificate (dev mode or node
-            // unreachable — quorum will not meet BFT threshold).
+            // Unsigned local certificate (cache placeholder).
             quorum.add(WriteCertificate {
                 blob_id: blob.id,
                 shard_index: i as u32,
@@ -270,12 +174,10 @@ impl MikaClient {
             });
         }
 
-        // BFT quorum check: need at least data_shards distinct nodes.
-        // When certificates carry node signatures (real deployment), verify
-        // them too. In dev/local mode (unsigned certs), signature check is
-        // skipped — quorum is based on distinct node count only.
+        // BFT quorum check (Walrus): need 2f+1 distinct nodes among the
+        // configured committee (f = (n-1)/3) AND at least k shards for decode.
         let distinct = quorum.distinct_nodes();
-        let required = params.data_shards;
+        let required = params.data_shards.max(bft_threshold(self.nodes.len()));
         let all_signed = quorum.certificates.iter().all(|c| !c.signature.is_empty());
         if all_signed {
             let verified = quorum.verified_count()?;
@@ -297,27 +199,14 @@ impl MikaClient {
         Ok((quorum, lease))
     }
 
-    /// Retrieve and reassemble a blob from storage nodes.
+    /// Reassemble a blob from slivers held in the local cache.
     pub async fn get_blob(&self, blob_id: &BlobID, params: &ErasureParams) -> Result<Blob> {
         let n = params.total_shards();
         let mut present: Vec<Option<Vec<u8>>> = vec![None; n];
         let mut original_len: Option<usize> = None;
 
         for (i, present_slot) in present.iter_mut().enumerate().take(n) {
-            // Try each node until we find the shard (Walrus: HTTP first,
-            // local fjall cache second).
             for node in &self.nodes {
-                #[cfg(feature = "onchain")]
-                if let Some(bytes) = self.http_get(node, blob_id, i as u32).await
-                    && let Ok(sliver) = Sliver::from_bytes(&bytes)
-                    && sliver.blob_id == *blob_id
-                {
-                    *present_slot = Some(sliver.data.clone());
-                    if original_len.is_none() {
-                        original_len = Some(sliver.original_len as usize);
-                    }
-                    break;
-                }
                 let key = Self::sliver_key(&node.0, i as u32);
                 if let Some(bytes) = self
                     .keyspace
@@ -353,8 +242,6 @@ impl StorageClient for MikaClient {
         self.keyspace
             .insert(key, bytes)
             .map_err(|e| MikaStorageError::Io(e.to_string()))?;
-        #[cfg(feature = "onchain")]
-        let _ = self.http_put(node, sliver).await;
         Ok(StoreResult {
             node_id: node.0.clone(),
             shard_index: sliver.shard_index,
@@ -368,16 +255,6 @@ impl StorageClient for MikaClient {
         blob_id: &BlobID,
         shard_index: u32,
     ) -> Result<RetrieveResult> {
-        #[cfg(feature = "onchain")]
-        if let Some(bytes) = self.http_get(node, blob_id, shard_index).await {
-            let sliver = Sliver::from_bytes(&bytes)
-                .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
-            return Ok(RetrieveResult {
-                node_id: node.0.clone(),
-                shard_index,
-                data: sliver.data,
-            });
-        }
         let key = Self::sliver_key(&node.0, shard_index);
         let bytes = self
             .keyspace

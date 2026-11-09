@@ -11,6 +11,33 @@ use mika_types::blob::BlobID;
 use mika_types::error::{MikaStorageError, Result};
 use serde::{Deserialize, Serialize};
 
+/// BFT quorum threshold for a committee of `n` storage nodes:
+/// `2f + 1` where `f = (n - 1) / 3` (Walrus consensus threshold).
+/// e.g. n=1 → 1, n=3 → 3, n=4 → 3, n=5 → 3, n=7 → 5.
+pub fn bft_threshold(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1 | 2 => 1,
+        3 => 3,
+        4..=6 => 3,
+        _ => {
+            let f = (n - 1) / 3;
+            2 * f + 1
+        }
+    }
+}
+
+/// Check that `certs` are all signatures over the same blob by *distinct*
+/// node keys (same key signing every cert is not a quorum, even if the
+/// node_id strings differ).
+fn distinct_public_keys(certs: &[WriteCertificate]) -> usize {
+    certs
+        .iter()
+        .map(|c| c.public_key.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 /// A storage node's attestation that it has stored a given sliver.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteCertificate {
@@ -125,6 +152,28 @@ impl WriteCertificateQuorum {
         self.distinct_nodes() >= required
     }
 
+    /// BFT quorum for a committee of `n` storage nodes: `2f+1` distinct
+    /// **node keys** with valid signatures (sizes are committee shards).
+    pub fn is_bft_quorum(&self, committee_size: usize) -> bool {
+        if committee_size == 0 {
+            return false;
+        }
+        let needed = bft_threshold(committee_size);
+        if distinct_public_keys(&self.certificates) < needed || self.distinct_nodes() < needed {
+            return false;
+        }
+        // Unsigned placeholder certs (dev mode: signatures from put_blob) are
+        // not accepted as BFT — every cert must verify.
+        self.certificates
+            .iter()
+            .all(|c| c.verify().unwrap_or(false))
+    }
+
+    /// Committee size these certs cover (distinct node ids presented).
+    pub fn committee_size(&self) -> usize {
+        self.distinct_nodes()
+    }
+
     /// Count verified certificates.
     pub fn verified_count(&self) -> Result<usize> {
         let mut count = 0;
@@ -237,5 +286,58 @@ mod tests {
         q.sign_all(&keypair.private_key, CurveType::K256).unwrap();
         assert!(q.verify_all().unwrap());
         assert_eq!(q.verified_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn bft_threshold_table() {
+        assert_eq!(bft_threshold(1), 1);
+        assert_eq!(bft_threshold(3), 3);
+        assert_eq!(bft_threshold(4), 3);
+        assert_eq!(bft_threshold(5), 3);
+        assert_eq!(bft_threshold(6), 3);
+        assert_eq!(bft_threshold(7), 5);
+        assert_eq!(bft_threshold(10), 7);
+    }
+
+    #[test]
+    fn bft_quorum_requires_distinct_keys() {
+        // 3 certs on 3 nodes, all signed by the *same* key → not a BFT quorum.
+        let blob_id = BlobID::from_content(b"bft");
+        let keypair = generate_keypair(CurveType::K256).unwrap();
+        let mut q = WriteCertificateQuorum::new(blob_id, 3, 2, 1, 100);
+        for i in 0..3 {
+            q.add(WriteCertificate {
+                blob_id,
+                shard_index: i,
+                node_id: format!("node-{i}"),
+                epoch: 1,
+                sliver_hash: [i as u8; 32],
+                signature: vec![],
+                public_key: keypair.public_key.clone(),
+                curve_type: "K256".to_string(),
+            });
+        }
+        assert!(
+            !q.is_bft_quorum(3),
+            "same key on every cert is not a BFT quorum"
+        );
+        // Distinct keys → passes.
+        let mut q2 = WriteCertificateQuorum::new(blob_id, 3, 2, 1, 100);
+        for i in 0..3 {
+            let kp = generate_keypair(CurveType::K256).unwrap();
+            let mut cert = WriteCertificate {
+                blob_id,
+                shard_index: i,
+                node_id: format!("node-{i}"),
+                epoch: 1,
+                sliver_hash: [i as u8; 32],
+                signature: vec![],
+                public_key: kp.public_key.clone(),
+                curve_type: "K256".to_string(),
+            };
+            cert.sign(&kp.private_key, CurveType::K256).unwrap();
+            q2.add(cert);
+        }
+        assert!(q2.is_bft_quorum(3));
     }
 }

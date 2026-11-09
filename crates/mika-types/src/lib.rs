@@ -11,7 +11,7 @@ pub mod onchain;
 pub mod sliver;
 pub mod storage;
 
-pub use blob::{Blob, BlobID};
+pub use blob::{Blob, BlobID, BlobType};
 pub use epoch::{Epoch, Lease, current_epoch};
 pub use error::{MikaStorageError, Result};
 pub use onchain::{BlobAnchor as StorageAnchor, StorageFeePayment, StoragePayment};

@@ -24,7 +24,6 @@ hex = { workspace = true }
 kanari-crypto = { workspace = true }
 kanari-types = { workspace = true }
 kanari-core = { workspace = true, optional = true }
-axum = { workspace = true }
 libp2p-identity = { workspace = true }
 
 [[bin]]
@@ -33,4 +32,4 @@ path = "src/main.rs"
 
 [features]
 default = ["onchain"]
-onchain = ["kanari-core", "mika-storage/onchain"]
+onchain = ["kanari-core", "mika-core/onchain", "mika-storage/onchain"]

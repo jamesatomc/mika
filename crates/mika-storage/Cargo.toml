@@ -13,12 +13,12 @@ description.workspace = true
 
 [dependencies]
 mika-types = { workspace = true }
-mika-core = { workspace = true }
 fjall = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+mika-core = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
 

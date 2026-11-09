@@ -6,6 +6,8 @@
 pub mod certificate;
 pub mod commitment;
 pub mod erasure;
+#[cfg(any(feature = "onchain", test))]
+pub mod rpc_client;
 pub mod storage_client;
 
 #[cfg(feature = "onchain")]
