@@ -3862,7 +3862,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bcs",
- "fjall",
  "hex",
  "kanari-common",
  "kanari-core",

@@ -30,7 +30,6 @@ kanari-rpc-api = { workspace = true, optional = true }
 smt = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 async-trait = { workspace = true }
-fjall = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
