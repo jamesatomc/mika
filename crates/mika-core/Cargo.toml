@@ -13,6 +13,7 @@ description.workspace = true
 
 [dependencies]
 mika-types = { workspace = true }
+mika-storage = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
@@ -30,7 +31,6 @@ smt = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 async-trait = { workspace = true }
 fjall = { workspace = true }
-reqwest = { workspace = true, features = ["json", "blocking", "multipart"] }
 tempfile = { workspace = true }
 
 [dev-dependencies]

@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hex::encode as hex_encode;
 use mika_core::KanariStorage;
-use mika_core::erasure::{ErasureParams, decode, rejoin_shards};
+use mika_core::erasure::{ErasureParams, rejoin_shards};
 use mika_server::{AppState, SharedState};
 use mika_storage::store::SliverStore;
 use mika_types::blob::BlobID;
@@ -19,6 +19,7 @@ use mika_types::epoch::current_epoch;
 use mika_types::onchain::BlobAnchor;
 use mika_types::{Blob, StoragePayment};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -36,8 +37,8 @@ enum Commands {
         /// Path to the file to upload
         #[arg(short, long)]
         file: PathBuf,
-        /// Entry peer multiaddr (ONE — the mesh spreads from there):
-        /// /ip4/<ip>/tcp/<port>/p2p/<PeerId>
+        /// Entry peer — full multiaddr /ip4/<ip>/tcp/<port>/p2p/<PeerId>,
+        /// or short `host:port` (e.g. 127.0.0.1:34001) resolved via ./.mesh
         #[arg(short, long)]
         nodes: String,
         /// Number of data shards (k)
@@ -58,6 +59,9 @@ enum Commands {
         /// Storage object ID on-chain (required when anchoring on-chain)
         #[arg(long)]
         storage_object_id: Option<String>,
+        /// Committee object id (required when anchoring on-chain; PoA gate)
+        #[arg(long)]
+        committee_id: Option<String>,
         /// Skip on-chain certify (anchor) after storage — offline dev mode
         #[arg(long, default_value_t = false)]
         no_anchor: bool,
@@ -69,7 +73,8 @@ enum Commands {
         /// Output file path
         #[arg(short, long)]
         output: PathBuf,
-        /// Entry peer multiaddr: /ip4/<ip>/tcp/<port>/p2p/<PeerId>
+        /// Entry peer — full multiaddr /ip4/<ip>/tcp/<port>/p2p/<PeerId>,
+        /// or short `host:port` (e.g. 127.0.0.1:34001) resolved via ./.mesh
         #[arg(short = 'n', long)]
         nodes: String,
         /// Number of data shards (k)
@@ -78,6 +83,11 @@ enum Commands {
         /// Number of parity shards (m)
         #[arg(long, default_value_t = 2)]
         parity_shards: usize,
+    },
+    /// Committee registry (Walrus system-object analogue)
+    Committee {
+        #[command(subcommand)]
+        cmd: CommitteeCmd,
     },
     /// Start a Mika storage node (P2P-only)
     Node {
@@ -96,6 +106,10 @@ enum Commands {
         /// Bootstrap multiaddr (repeatable)
         #[arg(long)]
         bootstrap: Vec<String>,
+        /// Committee snapshot file (one `0x` address per line) — mirrors
+        /// the on-chain `mika::committee` registry; membership size is logged
+        #[arg(long)]
+        committee_signers: Option<PathBuf>,
     },
     /// Get a storage proof for a sliver (via the entry peer)
     Proof {
@@ -103,7 +117,8 @@ enum Commands {
         blob_id: String,
         /// Shard index
         shard_index: u32,
-        /// Entry peer multiaddr: /ip4/<ip>/tcp/<port>/p2p/<PeerId>
+        /// Entry peer — full multiaddr /ip4/<ip>/tcp/<port>/p2p/<PeerId>,
+        /// or short `host:port` (e.g. 127.0.0.1:34001) resolved via ./.mesh
         #[arg(short = 'n', long)]
         nodes: String,
     },
@@ -170,11 +185,62 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum CommitteeCmd {
+    /// Register a node key in the committee object (shared registry)
+    Join {
+        /// Committee object id (from `committee::init` event)
+        #[arg(long)]
+        committee_id: String,
+        /// Node key address to register (hex)
+        #[arg(long)]
+        node_key: String,
+        /// Shards this node serves (default 1)
+        #[arg(long, default_value_t = 1)]
+        shard_count: u64,
+        /// Keystore password for decrypting the signing key
+        #[arg(long)]
+        password: String,
+    },
+    /// Remove a node key from the committee object
+    Leave {
+        #[arg(long)]
+        committee_id: String,
+        #[arg(long)]
+        node_key: String,
+        #[arg(long)]
+        password: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Committee { cmd } => match cmd {
+            CommitteeCmd::Join {
+                committee_id,
+                node_key,
+                shard_count,
+                password,
+            } => {
+                let storage = KanariStorage::from_config(&password, "cli-node")?;
+                let tx = storage
+                    .join_committee(&committee_id, &node_key, shard_count)
+                    .await?;
+                eprintln!("Joined committee {} (tx {})", committee_id, tx);
+            }
+            CommitteeCmd::Leave {
+                committee_id,
+                node_key,
+                password,
+            } => {
+                let storage = KanariStorage::from_config(&password, "cli-node")?;
+                let tx = storage.leave_committee(&committee_id, &node_key).await?;
+                eprintln!("Left committee {} (tx {})", committee_id, tx);
+            }
+        },
         Commands::Buy {
             amount,
             password,
@@ -302,6 +368,7 @@ async fn main() -> Result<()> {
             blob_type,
             password,
             storage_object_id,
+            committee_id,
             no_anchor,
         } => {
             let data = tokio::fs::read(&file)
@@ -345,10 +412,23 @@ async fn main() -> Result<()> {
             // to any other node.
             let shards = mika_core::erasure::split_into_shards(&blob.data, params.data_shards)
                 .with_context(|| "split")?;
-            let encoded = mika_core::erasure::encode(&shards, &params).with_context(|| "encode")?;
+            // Red Stuff 2D (Walrus-style): primary + secondary grids, 2n
+            // slivers total. Primary indices 0..n, secondary n..2n — the
+            // entry peer stores every sliver and announces them all.
+            let encoded = mika_core::erasure::redstuff_encode(&shards, &params)
+                .with_context(|| "redstuff encode")?;
+            let n = params.total_shards() as u32;
             let slivers: Vec<mika_types::sliver::Sliver> = encoded
+                .primary
                 .iter()
                 .enumerate()
+                .chain(
+                    encoded
+                        .secondary
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i + n as usize, s)),
+                )
                 .map(|(i, shard)| {
                     mika_types::sliver::Sliver::new(
                         blob.id,
@@ -421,7 +501,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // (2/2): CERTIFY on-chain — anchor blob commitment with owner
+            // (2/3): CERTIFY on-chain — anchor blob commitment with owner
             // (records `fee_paid = fee` on-chain at upload time — this is
             // the "pay on upload" step for Walrus-style certify).
             if !no_anchor && let Some(kv) = kanari.as_ref() {
@@ -435,15 +515,40 @@ async fn main() -> Result<()> {
                     epoch: current_epoch(),
                     fee_paid: fee,
                 };
-                match kv.anchor_blob(&anchor).await {
+                let anchored = match kv.anchor_blob(&anchor).await {
                     Ok(()) => {
                         eprintln!("Paid + certified on-chain: {} mist", fee);
                         eprintln!("  anchor_blob (certify) committed");
+                        true
                     }
                     Err(e) => {
                         // Idempotent on retry: an already-anchored blob aborts
                         // on-chain (E_BLOB_ALREADY_ANCHORED) — treat as ok.
                         eprintln!("Warning: anchor_blob after quorum failed: {e}");
+                        false
+                    }
+                };
+                // (3/3): PoA — aggregate the 2/3 write-certificate quorum and
+                // record it on-chain (Walrus availability certificate).
+                if anchored {
+                    match mika_core::certificate::PoaCert::aggregate(
+                        &quorum,
+                        commitment,
+                        current_epoch(),
+                    ) {
+                        Ok(poa) => match kv
+                            .record_availability(committee_id.as_deref().unwrap_or(""), &poa)
+                            .await
+                        {
+                            Ok(tx) => eprintln!(
+                                "  PoA recorded on-chain ({} distinct signers, tx {})",
+                                poa.signer_count, tx
+                            ),
+                            Err(e) => eprintln!("Warning: record_availability failed: {e}"),
+                        },
+                        Err(e) => {
+                            eprintln!("Warning: PoA quorum not met, skipping record: {e}")
+                        }
                     }
                 }
             }
@@ -468,21 +573,31 @@ async fn main() -> Result<()> {
             let blob_id = BlobID::try_from(blob_id.as_str())?;
             let params = ErasureParams::new(data_shards, parity_shards)?;
 
-            let all_shards: Vec<u32> = (0..params.total_shards() as u32).collect();
+            // Red Stuff 2D index space: primary 0..n, secondary n..2n.
+            let n = params.total_shards() as u32;
+            let all_shards: Vec<u32> = (0..2 * n).collect();
             let fetched = mika_server::p2p::fetch_slivers(&nodes, blob_id, all_shards)
                 .await
                 .with_context(|| format!("fetch from entry peer {nodes}"))?;
-            let mut present: Vec<Option<Vec<u8>>> = vec![None; params.total_shards()];
+            let mut primary: Vec<Option<Vec<u8>>> = vec![None; params.total_shards()];
+            let mut secondary: Vec<Option<Vec<u8>>> = vec![None; params.total_shards()];
             let mut original_len: Option<usize> = None;
             for sliver in fetched {
-                if sliver.blob_id == blob_id {
-                    present[sliver.shard_index as usize] = Some(sliver.data.clone());
-                    if original_len.is_none() {
-                        original_len = Some(sliver.original_len as usize);
-                    }
+                if sliver.blob_id != blob_id {
+                    continue;
+                }
+                let idx = sliver.shard_index as usize;
+                if idx < n as usize {
+                    primary[idx] = Some(sliver.data.clone());
+                } else if idx < 2 * n as usize {
+                    secondary[idx - n as usize] = Some(sliver.data.clone());
+                }
+                if original_len.is_none() {
+                    original_len = Some(sliver.original_len as usize);
                 }
             }
-            let data_shards = decode(&present, &params).with_context(|| "decode shards")?;
+            let data_shards = mika_core::erasure::redstuff_decode(&primary, &secondary, &params)
+                .with_context(|| "decode shards")?;
             let original_len =
                 original_len.unwrap_or_else(|| data_shards.iter().map(|s| s.len()).sum());
             let data = rejoin_shards(&data_shards, original_len);
@@ -502,7 +617,20 @@ async fn main() -> Result<()> {
             no_p2p,
             p2p_listen,
             bootstrap,
+            committee_signers,
         } => {
+            let committee_snapshot = if let Some(path) = &committee_signers {
+                let committee =
+                    mika_types::committee::load_committee_file(&path.to_string_lossy())?;
+                eprintln!(
+                    "mika committee: {} member(s) from {}",
+                    committee.len(),
+                    path.display()
+                );
+                committee
+            } else {
+                Vec::new()
+            };
             let store = SliverStore::new(data_dir.clone())?;
             let epoch = current_epoch();
             let mut app_state = AppState::new(node_id.clone(), store, epoch);
@@ -521,6 +649,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            app_state.committee = std::sync::Arc::new(committee_snapshot);
             let state: SharedState = Arc::new(app_state);
             if let Some(p2p) = p2p_ready {
                 *state.p2p.lock().unwrap() = Some(p2p);
@@ -562,10 +691,73 @@ async fn main() -> Result<()> {
                             }
                             let mut guard = drive_state.p2p.lock().unwrap();
                             if let Some(p) = guard.as_mut() {
-                                p.send_fetch(&ann.peer_id, ann.blob_id, ann.shard_index);
+                                // Walrus-style routing: fetch from the shard's
+                                // assigned node when known, else the announcer.
+                                let assigned_peer = {
+                                    let committee = drive_state.committee.clone();
+                                    if committee.is_empty() {
+                                        None
+                                    } else {
+                                        let mut sorted: Vec<_> =
+                                            committee.iter().cloned().collect();
+                                        sorted.sort_by_key(|a| a.to_string());
+                                        let key = sorted[(ann.shard_index as usize) % sorted.len()]
+                                            .to_hex_literal();
+                                        p.assigned_peer(&key).map(|peer| peer.to_string())
+                                    }
+                                };
+                                p.send_fetch(
+                                    assigned_peer.as_deref().unwrap_or(&ann.peer_id),
+                                    ann.blob_id,
+                                    ann.shard_index,
+                                );
                             }
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+                // BFT self-vote loop (mirror of mika-node).
+                let vote_state = state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let blobs: Vec<_> = vote_state.store.list_blobs().await.unwrap_or_default();
+                        for blob_id in blobs {
+                            let present = vote_state.store.shards_for_blob(&blob_id).await;
+                            if present.is_empty() {
+                                continue;
+                            }
+                            let root = mika_server::p2p::state_root_for(&present);
+                            let voter = mika_types::committee::node_key_for_public_key(
+                                &vote_state.public_key,
+                            )
+                            .map(|v| v.into_bytes())
+                            .unwrap_or([0u8; 32]);
+                            let mut msg = Vec::new();
+                            msg.extend_from_slice(blob_id.to_hex().as_bytes());
+                            msg.extend_from_slice(&root);
+                            msg.extend_from_slice(&vote_state.epoch.to_le_bytes());
+                            msg.extend_from_slice(&voter);
+                            let digest = kanari_crypto::hash_data_blake3_array(&msg);
+                            let signature = kanari_crypto::signatures::sign_message(
+                                &vote_state.private_key,
+                                &digest,
+                                vote_state.curve_type,
+                            )
+                            .unwrap_or_default();
+                            let vote = mika_server::p2p::AvailabilityVote {
+                                blob_id: blob_id.to_hex(),
+                                state_root: root,
+                                epoch: vote_state.epoch,
+                                voter,
+                                public_key: vote_state.public_key.clone(),
+                                signature,
+                            };
+                            let mut guard = vote_state.p2p.lock().unwrap();
+                            if let Some(p) = guard.as_mut() {
+                                p.publish_vote(&vote);
+                            }
+                        }
                     }
                 });
             }

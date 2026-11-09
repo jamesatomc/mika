@@ -66,8 +66,10 @@ pub enum BlobType {
     Pq,
 }
 
-impl BlobType {
-    pub fn from_str(s: &str) -> Result<Self> {
+impl std::str::FromStr for BlobType {
+    type Err = crate::error::MikaStorageError;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "pq" | "dilithium" | "post-quantum" => Ok(BlobType::Pq),
             _ => Ok(BlobType::Binary),

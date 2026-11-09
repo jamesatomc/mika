@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+kanari-crypto = { workspace = true }
 libp2p-identity = { workspace = true }
 
 [[bin]]

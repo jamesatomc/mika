@@ -141,13 +141,6 @@ impl SliverStore {
         Ok(removed)
     }
 
-    /// Reclaim every blob whose anchors expired before `before_epoch`
-    /// (Walrus: unrenewed leases are reclaimed). Returns reclaimed blob count.
-    pub async fn prune_expired(&self, before_epoch: u64) -> Result<usize> {
-        let _ = before_epoch;
-        Ok(0)
-    }
-
     pub fn dir(&self) -> &PathBuf {
         &self.dir
     }
@@ -156,7 +149,6 @@ impl SliverStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mika_core::erasure::{ErasureParams, encode};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -164,9 +156,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SliverStore::new(dir.path().to_path_buf()).unwrap();
         let blob_id = BlobID::from_content(b"store test");
-        let params = ErasureParams::new(3, 2).unwrap();
-        let shards = encode(&vec![vec![1u8; 64]; 3], &params).unwrap();
-        let sliver = Sliver::new(blob_id, 0, 5, 3, 2, 64, shards[0].clone());
+        let sliver = Sliver::new(blob_id, 0, 5, 3, 2, 64, vec![1u8; 64]);
         store.put(&sliver).await.unwrap();
         assert!(store.has(&blob_id, 0).await);
         let back = store.get(&blob_id, 0).await.unwrap().unwrap();
@@ -178,10 +168,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SliverStore::new(dir.path().to_path_buf()).unwrap();
         let blob_id = BlobID::from_content(b"multi shard test");
-        let params = ErasureParams::new(4, 2).unwrap();
-        let shards = encode(&vec![vec![7u8; 32]; 4], &params).unwrap();
-        for (i, shard) in shards.iter().enumerate().take(params.data_shards as usize) {
-            let sliver = Sliver::new(blob_id, i as u32, 6, 4, 2, 32, shard.clone());
+        for i in 0..4u32 {
+            let sliver = Sliver::new(blob_id, i, 6, 4, 2, 32, vec![7u8; 32]);
             store.put(&sliver).await.unwrap();
         }
         let mut found = store.shards_for_blob(&blob_id).await;

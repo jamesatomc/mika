@@ -18,10 +18,5 @@ tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 
 [dev-dependencies]
-mika-core = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
-
-[features]
-default = []
-onchain = ["mika-core/onchain"]

@@ -1,22 +1,26 @@
 //! Mika storage node server crate — P2P-only (no HTTP API, no web UI).
 //!
 //! The node mesh is a pure libp2p network:
+//!
 //! - control plane: `gossipsub` (`mika/slivers/v1`) for sliver announcements
 //!   + KAD DHT for discovery, over `tcp`/`noise`/`yamux` (+ `dcutr`/`relay`/
-//!   `ping`/`identify`);
+//!     `ping`/`identify`);
 //! - data plane: libp2p request-response protocols carry the sliver bytes
 //!   directly between peers (`/mika/sliver-store/1.0.0` for ingress,
 //!   `/mika/sliver-fetch/1.0.0` for peer-pull dissemination).
+//!
 //! Sliver bytes never go over gossipsub.
 //!
 //! Storage itself (`SliverStore`, fjall) lives in the `mika-storage` crate;
 //! this crate re-exports it via `store_proxy`.
 
 pub mod p2p;
-pub mod store_proxy;
 
-use crate::store_proxy::SliverStore;
 use kanari_crypto::{CurveType, generate_keypair};
+/// The real DB crate — sliver bytes live in `mika-storage`'s fjall
+/// `SliverStore`; this crate is only the P2P mesh on top of it.
+pub use mika_storage::store::SliverStore;
+use move_core_types::account_address::AccountAddress;
 use std::sync::{Arc, Mutex};
 
 /// Unified application state for a P2P-only storage node.
@@ -41,6 +45,9 @@ pub struct AppState {
     /// `None` in unit tests / `--no-p2p` mode; the node then only keeps its
     /// fjall store.
     pub p2p: Arc<Mutex<Option<crate::p2p::MikaP2P>>>,
+    /// Committee registry snapshot (Walrus-style shared system object
+    /// mirror): member keys whose votes count toward BFT quorum.
+    pub committee: Arc<Vec<AccountAddress>>,
     /// Sliver announcements received over gossipsub, awaiting peer-pull.
     /// The drive loop drains this queue and fetches any sliver it doesn't
     /// hold yet from the announcing peer — so the uploader only talks to
@@ -62,22 +69,7 @@ impl AppState {
             p2p: Arc::new(Mutex::new(None)),
             peer_id: String::new(),
             pending: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Publish a sliver announcement (no-op when P2P is disabled).
-    pub fn announce_sliver(&self, blob_id: &mika_types::blob::BlobID, shard_index: u32) {
-        if let Ok(mut guard) = self.p2p.lock()
-            && let Some(p) = guard.as_mut()
-        {
-            let ann = crate::p2p::SliverAnnounce {
-                blob_id: blob_id.to_hex(),
-                shard_index,
-                node_id: self.node_id.clone(),
-                epoch: self.epoch,
-                peer_id: self.peer_id.clone(),
-            };
-            p.announce_sliver(&ann);
+            committee: Arc::new(Vec::new()),
         }
     }
 

@@ -81,5 +81,5 @@ fn lease_epoch_boundary() {
 fn store_prefix_scan_and_delete() {
     // covered by store tests; here we ensure delete_blob actually removes.
     // (store tests live in mika-storage)
-    assert!(mika_types::epoch::EPOCH_SECONDS > 0);
+    const { assert!(mika_types::epoch::EPOCH_SECONDS > 0) };
 }

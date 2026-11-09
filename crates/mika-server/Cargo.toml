@@ -26,6 +26,7 @@ anyhow = { workspace = true }
 fjall = { workspace = true }
 kanari-crypto = { workspace = true }
 kanari-types = { workspace = true }
+move-core-types = { workspace = true }
 futures = { workspace = true }
 libp2p-core = { workspace = true }
 libp2p-dcutr = { workspace = true }

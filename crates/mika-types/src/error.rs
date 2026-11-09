@@ -17,8 +17,6 @@ pub enum MikaStorageError {
     NodeUnavailable(String),
     #[error("write certificate invalid: {0}")]
     InvalidWriteCertificate(String),
-    #[error("read certificate invalid: {0}")]
-    InvalidReadCertificate(String),
     #[error("epoch expired")]
     EpochExpired,
     #[error("insufficient balance for storage fee: need {need}, have {have}")]

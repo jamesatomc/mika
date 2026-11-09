@@ -5,6 +5,7 @@
 //! slivers, anchors, fee payments and storage epochs. No engine, no I/O.
 
 pub mod blob;
+pub mod committee;
 pub mod epoch;
 pub mod error;
 pub mod onchain;

@@ -3870,11 +3870,11 @@ dependencies = [
  "kanari-rpc-api",
  "kanari-rpc-client",
  "kanari-types",
+ "mika-storage",
  "mika-types",
  "move-core-types",
  "proptest",
  "rand 0.10.3",
- "reqwest",
  "serde",
  "serde_json",
  "smt",
@@ -3889,6 +3889,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "kanari-crypto",
  "libp2p-identity",
  "mika-server",
  "mika-storage",
@@ -3925,6 +3926,7 @@ dependencies = [
  "mika-core",
  "mika-storage",
  "mika-types",
+ "move-core-types",
  "rand 0.10.3",
  "serde",
  "serde_json",
@@ -3939,7 +3941,6 @@ name = "mika-storage"
 version = "0.0.1"
 dependencies = [
  "fjall",
- "mika-core",
  "mika-types",
  "proptest",
  "rand 0.10.3",
@@ -3968,16 +3969,6 @@ name = "mime"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
-
-[[package]]
-name = "mime_guess"
-version = "2.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
-dependencies = [
- "mime",
- "unicase",
-]
 
 [[package]]
 name = "minibytes"
@@ -5662,9 +5653,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
- "futures-util",
  "h2",
  "http",
  "http-body",
@@ -5675,7 +5664,6 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
- "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -7006,12 +6994,6 @@ name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
-
-[[package]]
-name = "unicase"
-version = "2.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-ident"

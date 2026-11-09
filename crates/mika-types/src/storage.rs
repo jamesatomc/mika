@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 pub const E_BLOB_ALREADY_ANCHORED: u64 = 0;
 pub const E_NOT_OWNER: u64 = 1;
 pub const E_NOT_FROM_OWNER: u64 = 2;
+pub const E_BLOB_NOT_ANCHORED: u64 = 3;
+pub const E_POA_QUORUM_NOT_MET: u64 = 4;
+
+/// Minimum distinct storage nodes for a PoA (matches Move `MIN_POA_SIGNERS`).
+pub const MIN_POA_SIGNERS: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // Structs (mirror Move `public struct ... has key, store, drop`)
@@ -32,7 +37,7 @@ pub struct Storage {
     pub quota: u64,
 }
 
-/// `BlobAnchor { id: u64, blob_id: address, owner: address, commitment: vector<u8>, epoch: u64, fee_paid: u64, created_at: u64 }`
+/// `BlobAnchor { id: u64, blob_id: address, owner: address, commitment: vector<u8>, epoch: u64, fee_paid: u64, created_at: u64, certified_at: u64 }`
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BlobAnchor {
     pub id: u64,
@@ -42,6 +47,8 @@ pub struct BlobAnchor {
     pub epoch: u64,
     pub fee_paid: u64,
     pub created_at: u64,
+    /// 0 = PoA not recorded (Move appends after `created_at`).
+    pub certified_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +111,15 @@ pub struct BlobTransferredEvent {
 pub struct StorageQuotaBoughtEvent {
     pub amount: u64,
     pub total_quota: u64,
+}
+
+/// `BlobAvailabilityCertifiedEvent { blob_id: address, signer_count: u64, epoch: u64, certified_at: u64 }`
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BlobAvailabilityCertifiedEvent {
+    pub blob_id: AccountAddress,
+    pub signer_count: u64,
+    pub epoch: u64,
+    pub certified_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +233,29 @@ impl UpgradeBlobRequest {
     }
 }
 
+/// Args for `record_availability(committee_id: address, storage_id: address,
+/// blob_id: address, signers: vector<address>, ctx: &mut TxContext)`
+/// (`ctx` injected by the node — do not send).
+#[derive(Debug, Clone)]
+pub struct RecordAvailabilityRequest {
+    pub committee_id: AccountAddress,
+    pub storage_id: AccountAddress,
+    pub blob_id: AccountAddress,
+    pub signers: Vec<AccountAddress>,
+}
+
+impl RecordAvailabilityRequest {
+    pub fn encode_args(&self) -> Result<Vec<Vec<u8>>> {
+        let signers_bytes: Vec<Vec<u8>> = self.signers.iter().map(|a| a.to_vec()).collect();
+        Ok(vec![
+            self.committee_id.to_vec(),
+            self.storage_id.to_vec(),
+            self.blob_id.to_vec(),
+            bcs::to_bytes(&signers_bytes)?,
+        ])
+    }
+}
+
 /// Args for `transfer_blob_ownership(storage_id: address, blob_id: address,
 /// from: address, to: address, rent_transfer_amount: u64)`
 #[derive(Debug, Clone)]
@@ -282,6 +321,8 @@ impl StorageModule {
             reclaim_blob: "reclaim_blob",
             transfer_blob_ownership: "transfer_blob_ownership",
             upgrade_blob: "upgrade_blob",
+            record_availability: "record_availability",
+            is_blob_certified: "is_blob_certified",
             get_blob_anchor: "get_blob_anchor",
             is_blob_anchored: "is_blob_anchored",
         }
@@ -297,6 +338,8 @@ pub struct StorageFunctions {
     pub reclaim_blob: &'static str,
     pub transfer_blob_ownership: &'static str,
     pub upgrade_blob: &'static str,
+    pub record_availability: &'static str,
+    pub is_blob_certified: &'static str,
     pub get_blob_anchor: &'static str,
     pub is_blob_anchored: &'static str,
 }
@@ -371,5 +414,39 @@ mod tests {
         assert_eq!(E_BLOB_ALREADY_ANCHORED, 0);
         assert_eq!(E_NOT_OWNER, 1);
         assert_eq!(E_NOT_FROM_OWNER, 2);
+        assert_eq!(E_BLOB_NOT_ANCHORED, 3);
+        assert_eq!(E_POA_QUORUM_NOT_MET, 4);
+    }
+
+    #[test]
+    fn record_availability_args_encode_in_order() {
+        let req = RecordAvailabilityRequest {
+            committee_id: AccountAddress::from_hex_literal("0x0").unwrap(),
+            storage_id: AccountAddress::from_hex_literal("0x1").unwrap(),
+            blob_id: AccountAddress::from_hex_literal("0x2").unwrap(),
+            signers: vec![
+                AccountAddress::from_hex_literal("0x3").unwrap(),
+                AccountAddress::from_hex_literal("0x4").unwrap(),
+            ],
+        };
+        let args = req.encode_args().unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0].len(), 32);
+        assert_eq!(args[1].len(), 32);
+        assert_eq!(args[2].len(), 32);
+        // signers: BCS vector of 32-byte addresses (2 entries)
+        assert!(args[3].len() > 64);
+    }
+
+    #[test]
+    fn record_availability_function_name() {
+        assert_eq!(
+            StorageModule::function_names().record_availability,
+            "record_availability"
+        );
+        assert_eq!(
+            StorageModule::function_names().is_blob_certified,
+            "is_blob_certified"
+        );
     }
 }

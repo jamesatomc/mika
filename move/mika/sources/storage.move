@@ -5,10 +5,17 @@ module mika::storage {
     use kanari_system::event;
     use kanari_system::transfer;
     use kanari_system::borrow;
+    use mika::committee;
 
     const E_BLOB_ALREADY_ANCHORED: u64 = 0;
     const E_NOT_OWNER: u64 = 1;
     const E_NOT_FROM_OWNER: u64 = 2;
+    const E_BLOB_NOT_ANCHORED: u64 = 3;
+    const E_POA_QUORUM_NOT_MET: u64 = 4;
+
+    /// Minimum number of distinct storage nodes whose stored-sliver
+    /// certificates must be aggregated before PoA can be recorded.
+    const MIN_POA_SIGNERS: u64 = 2;
 
     public struct Storage has key, store, drop {
         id: UID,
@@ -23,7 +30,9 @@ module mika::storage {
         commitment: vector<u8>,
         epoch: u64,
         fee_paid: u64,
-        created_at: u64
+        created_at: u64,
+        // Walrus-style PoA: 0 = not certified; set by `record_availability`.
+        certified_at: u64
     }
 
     public struct BlobUpgradedEvent has copy, drop, store {
@@ -50,6 +59,15 @@ module mika::storage {
         commitment: vector<u8>,
         epoch: u64,
         fee_paid: u64
+    }
+
+    /// Walrus-style Proof-of-Availability event: an aggregated quorum
+    /// certificate for a blob has been recorded on-chain.
+    public struct BlobAvailabilityCertifiedEvent has copy, drop, store {
+        blob_id: address,
+        signer_count: u64,
+        epoch: u64,
+        certified_at: u64
     }
 
     public struct StorageRentPaidEvent has copy, drop, store {
@@ -124,7 +142,8 @@ module mika::storage {
             commitment,
             epoch,
             fee_paid,
-            created_at: tx_context::epoch_timestamp_ms(ctx)
+            created_at: tx_context::epoch_timestamp_ms(ctx),
+            certified_at: 0
         };
 
         vector::push_back(&mut storage.anchors, anchor);
@@ -137,6 +156,71 @@ module mika::storage {
                 fee_paid
             }
         );
+    }
+
+    /// Walrus-style Proof-of-Availability: record an aggregated quorum
+    /// certificate for an anchored blob. The on-chain gate is committee
+    /// membership: `signers` must be distinct members of the shared
+    /// `mika::committee` registry and reach the 2/3 quorum of the CURRENT
+    /// committee size (read live — no off-chain arithmetic to game).
+    /// Signatures are verified off-chain by the client before submission
+    /// (the chain has no signature-verification native); the event feeds
+    /// the same batches to watchers.
+    public fun record_availability(
+        committee_id: address,
+        storage_id: address,
+        blob_id: address,
+        signers: vector<address>,
+        ctx: &mut TxContext
+    ) {
+        let size = committee::committee_size(committee_id);
+        assert!(size >= MIN_POA_SIGNERS, E_POA_QUORUM_NOT_MET);
+        let quorum = count_committee_signers(committee_id, signers);
+        // 2/3 BFT honest threshold: ceil(2n/3)... (2n+2)/3 for n>=1.
+        let threshold = (size * 2 + 2) / 3;
+        assert!(quorum >= threshold, E_POA_QUORUM_NOT_MET);
+        let storage = borrow::borrow_mut<Storage>(storage_id);
+        assert!(blob_exists(&storage.anchors, blob_id), E_BLOB_NOT_ANCHORED);
+        let anchor_index = find_anchor_index(&storage.anchors, blob_id);
+        let anchor = vector::borrow_mut(&mut storage.anchors, anchor_index);
+        let now_ms = tx_context::epoch_timestamp_ms(ctx);
+        anchor.certified_at = now_ms;
+        event::emit(
+            BlobAvailabilityCertifiedEvent {
+                blob_id,
+                signer_count: quorum,
+                epoch: anchor.epoch,
+                certified_at: now_ms
+            }
+        );
+    }
+
+    fun count_committee_signers(
+        committee_id: address,
+        signers: vector<address>
+    ): u64 {
+        let mut distinct = vector::empty<address>();
+        let mut i = 0;
+        while (i < vector::length(&signers)) {
+            let s = *vector::borrow(&signers, i);
+            if (committee::is_member(committee_id, s) && !contains_address(&distinct, s)) {
+                vector::push_back(&mut distinct, s);
+            };
+            i = i + 1;
+        };
+        vector::length(&distinct)
+    }
+
+    fun contains_address(v: &vector<address>, x: address): bool {
+        let mut i = 0;
+        let mut found = false;
+        while (i < vector::length(v)) {
+            if (*vector::borrow(v, i) == x) {
+                found = true;
+            };
+            i = i + 1;
+        };
+        found
     }
 
     public fun pay_storage_rent(
@@ -217,7 +301,8 @@ module mika::storage {
             commitment,
             epoch,
             fee_paid,
-            created_at: tx_context::epoch_timestamp_ms(ctx)
+            created_at: tx_context::epoch_timestamp_ms(ctx),
+            certified_at: 0
         };
         vector::push_back(&mut storage.anchors, anchor);
         event::emit(
@@ -277,6 +362,14 @@ module mika::storage {
     public fun is_blob_anchored(storage_id: address, blob_id: address): bool {
         let storage = borrow::borrow<Storage>(storage_id);
         blob_exists(&storage.anchors, blob_id)
+    }
+
+    /// Walrus-style: has a blob's PoA been recorded?
+    public fun is_blob_certified(storage_id: address, blob_id: address): bool {
+        let storage = borrow::borrow<Storage>(storage_id);
+        let anchor_index = find_anchor_index(&storage.anchors, blob_id);
+        let anchor = vector::borrow(&storage.anchors, anchor_index);
+        anchor.certified_at != 0
     }
 
     fun blob_exists(anchors: &vector<BlobAnchor>, blob_id: address): bool {

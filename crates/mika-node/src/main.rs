@@ -41,6 +41,12 @@ struct Cli {
     /// Bootstrap multiaddr `/ip4/<ip>/tcp/<port>/p2p/<PeerId>` (repeatable)
     #[arg(long)]
     bootstrap: Vec<String>,
+
+    /// Committee snapshot file (one `0x` address per line): mirrors the
+    /// on-chain `mika::committee` registry. The size is logged; peers whose
+    /// keys are in the file are the committee their certs aggregate for.
+    #[arg(long)]
+    committee_signers: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -52,6 +58,18 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("setting tracer: {}", e))?;
 
     let cli = Cli::parse();
+
+    let committee_snapshot = if let Some(path) = &cli.committee_signers {
+        let committee = mika_types::committee::load_committee_file(&path.to_string_lossy())?;
+        info!(
+            "mika committee: {} member(s) from {}",
+            committee.len(),
+            path.display()
+        );
+        committee
+    } else {
+        Vec::new()
+    };
 
     // Build the swarm first so we know our PeerId for announcements.
     let p2p_ready = if !cli.no_p2p {
@@ -76,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(p) = p2p_ready.as_ref() {
         app_state.peer_id = p.peer_id.to_string();
     }
+    app_state.committee = Arc::new(committee_snapshot);
     let state: SharedState = Arc::new(app_state);
 
     if let Some(p2p) = p2p_ready {
@@ -116,13 +135,76 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let mut guard = drive_state.p2p.lock().unwrap();
                     if let Some(p) = guard.as_mut() {
-                        p.send_fetch(&ann.peer_id, ann.blob_id, ann.shard_index);
+                        // Walrus-style routing: fetch from the shard's
+                        // assigned node when known, else the announcer.
+                        let assigned_peer = {
+                            let committee = drive_state.committee.clone();
+                            if committee.is_empty() {
+                                None
+                            } else {
+                                let mut sorted: Vec<_> = committee.iter().cloned().collect();
+                                sorted.sort_by_key(|a| a.to_string());
+                                let key = sorted[(ann.shard_index as usize) % sorted.len()]
+                                    .to_hex_literal();
+                                p.assigned_peer(&key).map(|peer| peer.to_string())
+                            }
+                        };
+                        p.send_fetch(
+                            assigned_peer.as_deref().unwrap_or(&ann.peer_id),
+                            ann.blob_id,
+                            ann.shard_index,
+                        );
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         });
     }
+
+    // BFT self-vote loop: periodically sign and gossip the availability
+    // state root for every blob we hold. When 2/3 of the committee votes
+    // the same root, the blob is committed (Walrus-style PoA at runtime).
+    let vote_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let blobs: Vec<_> = vote_state.store.list_blobs().await.unwrap_or_default();
+            for blob_id in blobs {
+                let present = vote_state.store.shards_for_blob(&blob_id).await;
+                if present.is_empty() {
+                    continue;
+                }
+                let root = mika_server::p2p::state_root_for(&present);
+                let voter = mika_types::committee::node_key_for_public_key(&vote_state.public_key)
+                    .map(|v| v.into_bytes())
+                    .unwrap_or([0u8; 32]);
+                let mut msg = Vec::new();
+                msg.extend_from_slice(blob_id.to_hex().as_bytes());
+                msg.extend_from_slice(&root);
+                msg.extend_from_slice(&vote_state.epoch.to_le_bytes());
+                msg.extend_from_slice(&voter);
+                let digest = kanari_crypto::hash_data_blake3_array(&msg);
+                let signature = kanari_crypto::signatures::sign_message(
+                    &vote_state.private_key,
+                    &digest,
+                    vote_state.curve_type,
+                )
+                .unwrap_or_default();
+                let vote = mika_server::p2p::AvailabilityVote {
+                    blob_id: blob_id.to_hex(),
+                    state_root: root,
+                    epoch: vote_state.epoch,
+                    voter,
+                    public_key: vote_state.public_key.clone(),
+                    signature,
+                };
+                let mut guard = vote_state.p2p.lock().unwrap();
+                if let Some(p) = guard.as_mut() {
+                    p.publish_vote(&vote);
+                }
+            }
+        }
+    });
 
     // Walrus reclaim loop: sweep expired leases, delete their shards.
     let reclaim_state = state.clone();

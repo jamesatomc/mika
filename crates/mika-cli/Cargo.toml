@@ -32,4 +32,4 @@ path = "src/main.rs"
 
 [features]
 default = ["onchain"]
-onchain = ["kanari-core", "mika-core/onchain", "mika-storage/onchain"]
+onchain = ["kanari-core", "mika-core/onchain"]

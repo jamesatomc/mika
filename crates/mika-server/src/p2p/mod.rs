@@ -34,6 +34,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 pub const SLIVERS_TOPIC: &str = "mika/slivers/v1";
+pub const VOTES_TOPIC: &str = "mika/votes/v1";
 pub const STORE_PROTOCOL: &str = "/mika/sliver-store/1.0.0";
 pub const FETCH_PROTOCOL: &str = "/mika/sliver-fetch/1.0.0";
 
@@ -45,6 +46,9 @@ pub struct SliverAnnounce {
     pub epoch: u64,
     /// libp2p PeerId of the holder (peers fetch directly from it).
     pub peer_id: String,
+    /// Canonical committee node_key (hex) of the holder — the shard
+    /// assignment router (Walrus-style map from shard → node).
+    pub node_key: String,
 }
 
 /// Request for the fetch protocol: which shard do we want?
@@ -52,6 +56,30 @@ pub struct SliverAnnounce {
 pub struct SliverFetchRequest {
     pub blob_id: String,
     pub shard_index: u32,
+}
+
+/// Application-level BFT availability vote (committee consensus analogue):
+/// a committee member's signed claim of the shard-bitmap state root for one
+/// blob. `state_root` = BLAKE3(concatenated present-shard indices).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvailabilityVote {
+    pub blob_id: String,
+    pub state_root: [u8; 32],
+    pub epoch: u64,
+    pub voter: [u8; 32],
+    pub public_key: String,
+    pub signature: Vec<u8>,
+}
+
+/// Compute the availability state root for a blob from its present shards.
+pub fn state_root_for(present_shards: &[u32]) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    let mut sorted = present_shards.to_vec();
+    sorted.sort_unstable();
+    for s in sorted {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    kanari_crypto::hash_data_blake3_array(&bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -96,65 +124,57 @@ impl rrp::Codec for StoreCodec {
     type Request = Vec<u8>;
     type Response = String;
 
-    fn read_request<T>(
+    async fn read_request<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
-    ) -> impl Future<Output = IoResult<Self::Request>> + Send
+    ) -> IoResult<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        async move {
-            let mut buf = Vec::new();
-            io.read_to_end(&mut buf).await?;
-            read_frame(&buf)
-        }
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        read_frame(&buf)
     }
 
-    fn read_response<T>(
+    async fn read_response<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
-    ) -> impl Future<Output = IoResult<Self::Response>> + Send
+    ) -> IoResult<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        async move {
-            let mut buf = Vec::new();
-            io.read_to_end(&mut buf).await?;
-            let payload = read_frame(&buf)?;
-            Ok::<String, std::io::Error>(String::from_utf8(payload).unwrap_or_default())
-        }
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        let payload = read_frame(&buf)?;
+        Ok::<String, std::io::Error>(String::from_utf8(payload).unwrap_or_default())
     }
 
-    fn write_request<T>(
+    async fn write_request<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
         req: Self::Request,
-    ) -> impl Future<Output = IoResult<()>> + Send
+    ) -> IoResult<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        async move {
-            io.write_all(&write_frame(&req)).await?;
-            io.flush().await
-        }
+        io.write_all(&write_frame(&req)).await?;
+        io.flush().await
     }
 
-    fn write_response<T>(
+    async fn write_response<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
         res: Self::Response,
-    ) -> impl Future<Output = IoResult<()>> + Send
+    ) -> IoResult<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        async move {
-            io.write_all(&write_frame(res.as_bytes())).await?;
-            io.flush().await
-        }
+        io.write_all(&write_frame(res.as_bytes())).await?;
+        io.flush().await
     }
 }
 
@@ -168,67 +188,59 @@ impl rrp::Codec for FetchCodec {
     type Request = SliverFetchRequest;
     type Response = Vec<u8>;
 
-    fn read_request<T>(
+    async fn read_request<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
-    ) -> impl Future<Output = IoResult<Self::Request>> + Send
+    ) -> IoResult<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        async move {
-            let mut buf = Vec::new();
-            io.read_to_end(&mut buf).await?;
-            let payload = read_frame(&buf)?;
-            serde_json::from_slice::<SliverFetchRequest>(&payload)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        }
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        let payload = read_frame(&buf)?;
+        serde_json::from_slice::<SliverFetchRequest>(&payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    fn read_response<T>(
+    async fn read_response<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
-    ) -> impl Future<Output = IoResult<Self::Response>> + Send
+    ) -> IoResult<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        async move {
-            let mut buf = Vec::new();
-            io.read_to_end(&mut buf).await?;
-            read_frame(&buf)
-        }
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await?;
+        read_frame(&buf)
     }
 
-    fn write_request<T>(
+    async fn write_request<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
         req: Self::Request,
-    ) -> impl Future<Output = IoResult<()>> + Send
+    ) -> IoResult<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        async move {
-            let payload = serde_json::to_vec(&req).unwrap_or_default();
-            io.write_all(&write_frame(&payload)).await?;
-            io.flush().await
-        }
+        let payload = serde_json::to_vec(&req).unwrap_or_default();
+        io.write_all(&write_frame(&payload)).await?;
+        io.flush().await
     }
 
-    fn write_response<T>(
+    async fn write_response<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
         res: Self::Response,
-    ) -> impl Future<Output = IoResult<()>> + Send
+    ) -> IoResult<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        async move {
-            io.write_all(&write_frame(&res)).await?;
-            io.flush().await
-        }
+        io.write_all(&write_frame(&res)).await?;
+        io.flush().await
     }
 }
 
@@ -248,16 +260,25 @@ pub struct MikaBehaviour {
 pub struct MikaP2P {
     pub swarm: Swarm<MikaBehaviour>,
     pub topic: IdentTopic,
+    pub votes_topic: IdentTopic,
     pub peer_id: PeerId,
     /// Outbound fetch requests in flight: request id → (peer, blob, shard).
     pending_fetch: HashMap<rrp::OutboundRequestId, (PeerId, String, u32)>,
     /// De-dup set so repeated announcements don't re-request.
     inflight: HashSet<(PeerId, String, u32)>,
-    /// Write certificates received for store requests we sent.
-    received_certs: Vec<mika_core::certificate::WriteCertificate>,
+    /// BFT availability votes: (blob_id, state_root) → distinct voters.
+    votes: HashMap<(String, [u8; 32]), HashSet<[u8; 32]>>,
+    /// (blob_id, state_root) pairs that reached 2/3 committee BFT commit.
+    committed: HashSet<(String, [u8; 32])>,
+    /// Committee node_key (hex) → libp2p PeerId learnt from announcements.
+    /// Used to forward store requests to the shard's assigned node.
+    peers_by_key: HashMap<String, PeerId>,
+    /// Store requests in flight for forwarding; response is proxied to the
+    /// original client's channel.
+    pending_forwards: HashMap<rrp::OutboundRequestId, rrp::ResponseChannel<String>>,
 }
 
-fn build_gossipsub(keypair: Keypair) -> Result<(gossipsub::Behaviour, IdentTopic)> {
+fn build_gossipsub(keypair: Keypair) -> Result<(gossipsub::Behaviour, IdentTopic, IdentTopic)> {
     let config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(ValidationMode::Strict)
@@ -275,7 +296,9 @@ fn build_gossipsub(keypair: Keypair) -> Result<(gossipsub::Behaviour, IdentTopic
         .map_err(|e| anyhow::anyhow!("Failed to create gossipsub: {}", e))?;
     let topic = IdentTopic::new(SLIVERS_TOPIC);
     gossipsub.subscribe(&topic)?;
-    Ok((gossipsub, topic))
+    let votes_topic = IdentTopic::new(VOTES_TOPIC);
+    gossipsub.subscribe(&votes_topic)?;
+    Ok((gossipsub, topic, votes_topic))
 }
 
 impl MikaP2P {
@@ -288,7 +311,7 @@ impl MikaP2P {
             .authenticate(noise::Config::new(&keypair)?)
             .multiplex(yamux::Config::default())
             .boxed();
-        let (gossipsub, topic) = build_gossipsub(keypair.clone())?;
+        let (gossipsub, topic, votes_topic) = build_gossipsub(keypair.clone())?;
 
         let store = rrp::Behaviour::new(
             [(STORE_PROTOCOL, rrp::ProtocolSupport::Full)],
@@ -330,10 +353,14 @@ impl MikaP2P {
         Ok(Self {
             swarm,
             topic,
+            votes_topic,
             peer_id: local_peer_id,
             pending_fetch: HashMap::new(),
             inflight: HashSet::new(),
-            received_certs: Vec::new(),
+            votes: HashMap::new(),
+            committed: HashSet::new(),
+            peers_by_key: HashMap::new(),
+            pending_forwards: HashMap::new(),
         })
     }
 
@@ -361,6 +388,76 @@ impl MikaP2P {
         }
     }
 
+    /// Publish a signed availability vote to the committee.
+    pub fn publish_vote(&mut self, vote: &AvailabilityVote) {
+        let data = serde_json::to_vec(vote).unwrap_or_default();
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.votes_topic.clone(), data)
+        {
+            debug!("mika p2p: publish vote: {e}");
+        }
+    }
+
+    /// Record a received vote; returns `true` once this vote completes the
+    /// 2/3 committee BFT commit for the (blob, state_root).
+    fn record_vote(
+        &mut self,
+        vote: AvailabilityVote,
+        committee: &[move_core_types::account_address::AccountAddress],
+    ) -> bool {
+        // Bind wire claims to a verified K256 signature over
+        // blob_id || state_root || epoch || voter, and to the advertised
+        // committee identity (node_key == BLAKE3(pubkey)).
+        let declared: [u8; 32] =
+            match mika_types::committee::node_key_for_public_key(&vote.public_key) {
+                Ok(a) => a.into_bytes(),
+                Err(_) => return false,
+            };
+        if declared != vote.voter {
+            return false;
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(vote.blob_id.as_bytes());
+        msg.extend_from_slice(&vote.state_root);
+        msg.extend_from_slice(&vote.epoch.to_le_bytes());
+        msg.extend_from_slice(&vote.voter);
+        let digest = kanari_crypto::hash_data_blake3_array(&msg);
+        if !kanari_crypto::signatures::verify_signature_with_curve(
+            &vote.public_key,
+            &digest,
+            &vote.signature,
+            kanari_crypto::CurveType::K256,
+        )
+        .unwrap_or(false)
+        {
+            debug!("mika p2p: bad vote signature for {}", vote.blob_id);
+            return false;
+        }
+        let key = (vote.blob_id, vote.state_root);
+        let voters = self.votes.entry(key.clone()).or_default();
+        let before = voters.len();
+        voters.insert(vote.voter);
+        if voters.len() == before {
+            return false;
+        }
+        let size = committee.len().max(1);
+        let needed = mika_types::committee::bft_quorum_threshold(size);
+        if voters.len() >= needed && !self.committed.contains(&key) {
+            self.committed.insert(key.clone());
+            info!(blob = %key.0, root = %hex::encode(key.1), voters = voters.len(), needed, "mika bft: availability committed");
+            return true;
+        }
+        false
+    }
+
+    /// Peer assigned to a committee node_key (hex), learnt from announces.
+    pub fn assigned_peer(&self, node_key_hex: &str) -> Option<PeerId> {
+        self.peers_by_key.get(node_key_hex).copied()
+    }
+
     /// Send a fetch request to a peer for one missing sliver.
     /// De-duplicated via the in-flight set; returns `false` when already
     /// requested (or the peer id is unparseable).
@@ -382,11 +479,6 @@ impl MikaP2P {
         true
     }
 
-    /// Write certificates received for store requests we sent.
-    pub fn take_certs(&mut self) -> Vec<mika_core::certificate::WriteCertificate> {
-        std::mem::take(&mut self.received_certs)
-    }
-
     /// Drain pending swarm events synchronously (no await) and return the
     /// slivers fetched from peers (outbound fetch responses — each is a
     /// complete serialized `Sliver`, self-describing its blob/shard).
@@ -402,11 +494,26 @@ impl MikaP2P {
                 SwarmEvent::Behaviour(MikaBehaviourEvent::Gossipsub(
                     gossipsub::Event::Message { message, .. },
                 )) => {
-                    if let Ok(ann) = serde_json::from_slice::<SliverAnnounce>(&message.data) {
+                    if message.topic.to_string() == VOTES_TOPIC {
+                        if let Ok(vote) = serde_json::from_slice::<AvailabilityVote>(&message.data)
+                        {
+                            // Committee membership: only votes from members
+                            // (or anyone when unconfigured) are counted.
+                            let committee = state.committee.clone();
+                            self.record_vote(vote, &committee);
+                        }
+                    } else if let Ok(ann) = serde_json::from_slice::<SliverAnnounce>(&message.data)
+                    {
                         info!(
                             "mika p2p: sliver {}#{} at {} (epoch {})",
                             ann.blob_id, ann.shard_index, ann.node_id, ann.epoch
                         );
+                        if !ann.peer_id.is_empty()
+                            && !ann.node_key.is_empty()
+                            && let Ok(pid) = ann.peer_id.parse::<PeerId>()
+                        {
+                            self.peers_by_key.insert(ann.node_key.clone(), pid);
+                        }
                         state.queue_announce(ann);
                     }
                 }
@@ -421,6 +528,38 @@ impl MikaP2P {
                     // Ingress: persist the sliver, track lease expiry, sign a
                     // write certificate for the BFT quorum.
                     if let Ok(sliver) = mika_types::sliver::Sliver::from_bytes(&request) {
+                        // Walrus-style assignment gate: when a committee is
+                        // configured, each sliver belongs to ONE member only
+                        // (round-robin by shard). If this is not it, forward
+                        // the store request (and the original client's
+                        // response channel) to the assigned peer. Unmapped
+                        // peers fall back to local store (availability first).
+                        let committee = state.committee.clone();
+                        let own_node_key =
+                            mika_types::committee::node_key_for_public_key(&state.public_key)
+                                .map(|k| k.to_hex_literal())
+                                .unwrap_or_default();
+                        let assigned = if committee.is_empty() {
+                            own_node_key.clone()
+                        } else {
+                            let mut sorted: Vec<move_core_types::account_address::AccountAddress> =
+                                committee.iter().cloned().collect();
+                            sorted.sort_by_key(|a| a.to_string());
+                            sorted[(sliver.shard_index as usize) % sorted.len()].to_hex_literal()
+                        };
+                        if !committee.is_empty() && assigned != own_node_key {
+                            if let Some(&target_peer) = self.peers_by_key.get(&assigned) {
+                                info!(peer = %peer, blob = %sliver.blob_id, shard = sliver.shard_index, assigned = %assigned, "mika p2p: forwarding sliver to assigned node");
+                                let rid = self
+                                    .swarm
+                                    .behaviour_mut()
+                                    .store
+                                    .send_request(&target_peer, request.clone());
+                                self.pending_forwards.insert(rid, channel);
+                                continue;
+                            }
+                            tracing::warn!(blob = %sliver.blob_id, shard = sliver.shard_index, assigned = %assigned, "mika p2p: assigned peer unknown — storing locally");
+                        }
                         let _ = state.store.put_sync(&sliver);
                         state.expiry.lock().unwrap().insert(
                             sliver.blob_id.to_hex(),
@@ -435,6 +574,7 @@ impl MikaP2P {
                             node_id: state.node_id.clone(),
                             epoch: state.epoch,
                             peer_id: state.peer_id.clone(),
+                            node_key: own_node_key,
                         };
                         self.announce_sliver(&ann);
                         let sliver_hash = kanari_crypto::hash_data_blake3_array(&sliver.data);
@@ -459,13 +599,21 @@ impl MikaP2P {
                     }
                 }
                 SwarmEvent::Behaviour(MikaBehaviourEvent::Store(rrp::Event::Message {
-                    message: rrp::Message::Response { response, .. },
+                    message:
+                        rrp::Message::Response {
+                            request_id,
+                            response,
+                        },
                     ..
                 })) => {
-                    if let Ok(cert) =
-                        serde_json::from_str::<mika_core::certificate::WriteCertificate>(&response)
-                    {
-                        self.received_certs.push(cert);
+                    // Forwarded store requests: proxy the assignee's
+                    // certificate back to the original client.
+                    if let Some(channel) = self.pending_forwards.remove(&request_id) {
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .store
+                            .send_response(channel, response);
                     }
                 }
                 SwarmEvent::Behaviour(MikaBehaviourEvent::Fetch(rrp::Event::Message {
@@ -586,10 +734,77 @@ fn peer_from_multiaddr(multiaddr: &str) -> Result<PeerId> {
         .parse::<Multiaddr>()?
         .iter()
         .find_map(|p| match p {
-            libp2p_core::multiaddr::Protocol::P2p(hash) => PeerId::try_from(hash).ok(),
+            libp2p_core::multiaddr::Protocol::P2p(hash) => Some(hash),
             _ => None,
         })
         .ok_or_else(|| anyhow::anyhow!("multiaddr needs /p2p/<PeerId>: {multiaddr}"))
+}
+
+/// Resolve a `--nodes` value to a usable multiaddr.
+///
+/// - Full multiaddr (`/ip4/<ip>/tcp/<port>/p2p/<PeerId>`) — used as-is.
+/// - `host:port` (e.g. `127.0.0.1:34003`) — looked up in an external
+///   mesh map (`MIKA_MESH_FILE` env var, else `./.mesh`, else
+///   `~/.config/mika/mesh`) so you don't have to paste 60-char peer ids.
+///   The map is operator-owned data (one `name <multiaddr>` per line,
+///   written by your own tooling) — the code never generates it.
+pub fn resolve_multiaddr(input: &str) -> Result<String> {
+    let input = input.trim();
+    if input.contains("/p2p/") {
+        return Ok(input.to_string());
+    }
+    let map = resolve_mesh_map()?;
+    for (hostport, multiaddr) in &map {
+        if hostport == input {
+            return Ok(multiaddr.clone());
+        }
+    }
+    anyhow::bail!(
+        "cannot resolve '{input}' to a peer.\n\
+         Pass a full multiaddr (/ip4/<ip>/tcp/<port>/p2p/<PeerId>) or make sure the mesh map\n\
+         exists at $MIKA_MESH_FILE, ./.mesh, or ~/.config/mika/mesh with\n\
+         `n1 /ip4/<ip>/tcp/<port>/p2p/<PeerId>` lines."
+    )
+}
+
+/// Read the operator-owned mesh map as a `host:port -> multiaddr` map.
+fn resolve_mesh_map() -> Result<Vec<(String, String)>> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("MIKA_MESH_FILE") {
+        candidates.push(std::path::PathBuf::from(p));
+    }
+    candidates.push(std::path::PathBuf::from(".mesh"));
+    if let Ok(home) = std::env::var("MIKA_HOME") {
+        candidates.push(std::path::PathBuf::from(&home).join("mesh"));
+    } else if let Ok(home) = std::env::var("HOME") {
+        candidates.push(std::path::PathBuf::from(&home).join(".config/mika/mesh"));
+    } else if let Ok(home) = std::env::var("USERPROFILE") {
+        candidates.push(std::path::PathBuf::from(&home).join(".config/mika/mesh"));
+    }
+    let mut content = None;
+    for path in candidates {
+        if let Ok(c) = std::fs::read_to_string(&path) {
+            content = Some(c);
+            break;
+        }
+    }
+    let content = content.ok_or_else(|| {
+        anyhow::anyhow!("mesh map not found ($MIKA_MESH_FILE, ./.mesh, ~/.config/mika/mesh)")
+    })?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let _name = parts.next();
+        let Some(addr) = parts.next() else { continue };
+        // /ip4/<host>/tcp/<port>/p2p/<PeerId>
+        let stripped = addr.trim_start_matches("/ip4/");
+        if let Some((rest, port_part)) = stripped.split_once("/tcp/") {
+            let host = rest.split('/').next().unwrap_or(rest);
+            let port = port_part.split('/').next().unwrap_or("");
+            out.push((format!("{host}:{port}"), addr.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 /// Push slivers to one entry peer over the store protocol and return the
@@ -599,8 +814,9 @@ pub async fn push_slivers(
     multiaddr: &str,
     slivers: Vec<mika_types::sliver::Sliver>,
 ) -> Result<Vec<mika_core::certificate::WriteCertificate>> {
-    let mut swarm = connect_client(multiaddr).await?;
-    let peer = peer_from_multiaddr(multiaddr)?;
+    let multiaddr = resolve_multiaddr(multiaddr)?;
+    let mut swarm = connect_client(&multiaddr).await?;
+    let peer = peer_from_multiaddr(&multiaddr)?;
     for sliver in &slivers {
         let bytes = sliver.to_bytes()?;
         swarm.behaviour_mut().store.send_request(&peer, bytes);
@@ -636,8 +852,9 @@ pub async fn fetch_slivers(
     blob_id: mika_types::blob::BlobID,
     shard_indices: Vec<u32>,
 ) -> Result<Vec<mika_types::sliver::Sliver>> {
-    let mut swarm = connect_client(multiaddr).await?;
-    let peer = peer_from_multiaddr(multiaddr)?;
+    let multiaddr = resolve_multiaddr(multiaddr)?;
+    let mut swarm = connect_client(&multiaddr).await?;
+    let peer = peer_from_multiaddr(&multiaddr)?;
     for idx in &shard_indices {
         swarm.behaviour_mut().fetch.send_request(
             &peer,
@@ -694,6 +911,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_multiaddr_full_passes_through() {
+        let addr = "/ip4/127.0.0.1/tcp/34001/p2p/12D3KooWExampleExampleExampleExampleExamplePeer";
+        assert_eq!(resolve_multiaddr(addr).unwrap(), addr);
+    }
+
+    #[test]
+    fn resolve_mesh_map_parses_host_port() {
+        let content = "n1 /ip4/127.0.0.1/tcp/34001/p2p/12D3KooWExampleExampleExamplePeer\nn2 /ip4/127.0.0.1/tcp/34002/p2p/12D3KooWExample2ExampleExamplePeer";
+        let mut out = Vec::new();
+        for line in content.lines() {
+            let mut parts = line.split_whitespace();
+            let _name = parts.next();
+            let Some(addr) = parts.next() else { continue };
+            let stripped = addr.trim_start_matches("/ip4/");
+            if let Some((rest, port_part)) = stripped.split_once("/tcp/") {
+                let host = rest.split('/').next().unwrap_or(rest);
+                let port = port_part.split('/').next().unwrap_or("");
+                out.push((format!("{host}:{port}"), addr.to_string()));
+            }
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "127.0.0.1:34001");
+        assert_eq!(out[1].0, "127.0.0.1:34002");
+    }
+
+    #[test]
     fn announce_carries_peer_id() {
         let ann = SliverAnnounce {
             blob_id: "abcd".into(),
@@ -701,6 +944,7 @@ mod tests {
             node_id: "n1".into(),
             epoch: 5,
             peer_id: "12D3KooWExamplePeerIdExamplePeerIdExamplePeerIdExamplePeer".into(),
+            node_key: "0x1".into(),
         };
         let v = serde_json::to_value(&ann).unwrap();
         assert!(v.get("peer_id").is_some());

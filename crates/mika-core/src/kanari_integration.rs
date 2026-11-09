@@ -178,15 +178,23 @@ impl KanariStorage {
         args: Vec<Vec<u8>>,
         object_inputs: Vec<ObjectInput>,
     ) -> Result<SignedTransaction> {
+        self.build_execute_function_tx_in(StorageModule::MODULE_NAME, function, args, object_inputs)
+    }
+
+    /// Build a `SignedTransaction` calling a function in an arbitrary
+    /// Mika Move module (`storage`, `committee`, …).
+    fn build_execute_function_tx_in(
+        &self,
+        module_name: &str,
+        function: &str,
+        args: Vec<Vec<u8>>,
+        object_inputs: Vec<ObjectInput>,
+    ) -> Result<SignedTransaction> {
         // RPC verification requires tagged sender: `CurveType:public_key`
         // (ko `kanari move` uses `get_sender_for_tx` for the same reason).
         let sender = format!("{}:{}", self.curve_type, self.public_key);
         // `address::module` from the 3 parts (no prejoined full-id constant).
-        let module = format!(
-            "{}::{}",
-            StorageModule::MODULE_ADDRESS,
-            StorageModule::MODULE_NAME
-        );
+        let module = format!("{}::{}", StorageModule::MODULE_ADDRESS, module_name);
 
         let gas_payment = Some(GasPayment {
             payment_objects: vec![],
@@ -586,6 +594,131 @@ impl KanariStorage {
         }];
         let signed_tx = self.build_execute_function_tx(
             StorageModule::function_names().buy_storage,
+            args,
+            object_inputs,
+        )?;
+        self.submit_transaction(signed_tx).await
+    }
+
+    /// Walrus-style PoA submission: record an aggregated quorum certificate
+    /// (`record_availability`) marking the anchor certified.
+    /// Move: record_availability(committee_id, storage_id, blob_id, signers, ctx).
+    /// Returns the tx digest.
+    pub async fn record_availability(
+        &self,
+        committee_id: &str,
+        poa: &crate::certificate::PoaCert,
+    ) -> Result<String> {
+        use mika_types::storage::RecordAvailabilityRequest;
+        let storage_id = self.storage_object_id.as_deref().ok_or_else(|| {
+            MikaStorageError::OnChain(
+                "storage_object_id not configured. Call with_storage_object_id() first".into(),
+            )
+        })?;
+        let committee_addr =
+            move_core_types::account_address::AccountAddress::from_hex_literal(committee_id)
+                .map_err(|e| MikaStorageError::OnChain(format!("bad committee address: {e}")))?;
+        let request = RecordAvailabilityRequest {
+            committee_id: committee_addr,
+            storage_id: move_core_types::account_address::AccountAddress::from_hex_literal(
+                storage_id,
+            )
+            .map_err(|e| MikaStorageError::OnChain(format!("bad storage address: {e}")))?,
+            blob_id: move_core_types::account_address::AccountAddress::new(poa.blob_id.0),
+            signers: poa
+                .certificates
+                .iter()
+                .filter(|c| c.verify().unwrap_or(false))
+                .filter_map(|c| mika_types::committee::node_key_for_public_key(&c.public_key).ok())
+                .collect(),
+        };
+        let args = request
+            .encode_args()
+            .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: storage_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::Shared),
+            mutable: true,
+        }];
+        let signed_tx = self.build_execute_function_tx(
+            StorageModule::function_names().record_availability,
+            args,
+            object_inputs,
+        )?;
+        self.submit_transaction(signed_tx).await
+    }
+
+    // -- committee registry (Walrus system-object analogue) --
+
+    /// Register a node key in the committee (`committee::join_committee`).
+    /// Move: join_committee(committee_id, node_key, shard_count, ctx).
+    pub async fn join_committee(
+        &self,
+        committee_id: &str,
+        node_key: &str,
+        shard_count: u64,
+    ) -> Result<String> {
+        use mika_types::committee::{CommitteeModule, JoinCommitteeRequest};
+        let parse = |s: &str| {
+            move_core_types::account_address::AccountAddress::from_hex_literal(s)
+                .map_err(|e| MikaStorageError::OnChain(format!("bad address {s}: {e}")))
+        };
+        let request = JoinCommitteeRequest {
+            committee_id: parse(committee_id)?,
+            node_key: parse(node_key)?,
+            shard_count,
+        };
+        let args = request
+            .encode_args()
+            .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: committee_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::Shared),
+            mutable: true,
+        }];
+        let signed_tx = self.build_execute_function_tx_in(
+            CommitteeModule::MODULE_NAME,
+            CommitteeModule::function_names().join_committee,
+            args,
+            object_inputs,
+        )?;
+        self.submit_transaction(signed_tx).await
+    }
+
+    /// Remove a node key from the committee (`committee::leave_committee`).
+    pub async fn leave_committee(&self, committee_id: &str, node_key: &str) -> Result<String> {
+        use mika_types::committee::{CommitteeModule, LeaveCommitteeRequest};
+        let parse = |s: &str| {
+            move_core_types::account_address::AccountAddress::from_hex_literal(s)
+                .map_err(|e| MikaStorageError::OnChain(format!("bad address {s}: {e}")))
+        };
+        let request = LeaveCommitteeRequest {
+            committee_id: parse(committee_id)?,
+            node_key: parse(node_key)?,
+        };
+        let args = request
+            .encode_args()
+            .map_err(|e| MikaStorageError::Serialization(e.to_string()))?;
+        let object_inputs = vec![ObjectInput {
+            object_ref: ObjectRef {
+                object_id: committee_id.to_string(),
+                version: None,
+                digest: None,
+            },
+            owner: Some(ObjectOwnerKind::Shared),
+            mutable: true,
+        }];
+        let signed_tx = self.build_execute_function_tx_in(
+            CommitteeModule::MODULE_NAME,
+            CommitteeModule::function_names().leave_committee,
             args,
             object_inputs,
         )?;

@@ -5,7 +5,6 @@
 //! availability and to authorize ownership transfers.
 
 use kanari_crypto::CurveType;
-use kanari_crypto::hash_data_blake3_array;
 use kanari_crypto::signatures::{sign_message, verify_signature_with_curve};
 use mika_types::blob::BlobID;
 use mika_types::error::{MikaStorageError, Result};
@@ -186,25 +185,67 @@ impl WriteCertificateQuorum {
     }
 }
 
-/// Proof that a client retrieved a blob's slivers from storage nodes.
+/// Walrus-style aggregated Proof-of-Availability certificate: the 2/3-quorum
+/// of stored-sliver attestations collected from the mesh, submitted to the
+/// chain (`record_availability`) as the blob's availability proof.
+///
+/// `signer_count` is the number of **distinct node keys** that verified —
+/// the value the Move side checks against `MIN_POA_SIGNERS`. The full
+/// certificate batch stays off-chain (watchers re-verify from the
+/// p2p-store exchange) and is not embedded in the tx.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadCertificate {
+pub struct PoaCert {
     pub blob_id: BlobID,
-    pub shard_indices: Vec<u32>,
-    pub reconstructed_hash: [u8; 32],
+    pub commitment: [u8; 32],
+    pub epoch: mika_types::epoch::Epoch,
+    pub signer_count: u64,
+    /// Verified certificates that make up the quorum (kept for auditing).
+    pub certificates: Vec<WriteCertificate>,
 }
 
-impl ReadCertificate {
-    pub fn verify_reconstruction(&self, data: &[u8]) -> Result<()> {
-        let digest = hash_data_blake3_array(data);
-        if digest != self.reconstructed_hash {
-            return Err(MikaStorageError::InvalidReadCertificate(
-                "reconstructed hash does not match certificate".into(),
-            ));
+impl PoaCert {
+    /// Aggregate `quorum` into a PoA certificate after verifying every
+    /// signature and requiring distinct keys ≥ `MIN_POA_SIGNERS` (Move side
+    /// repeats the same floor).
+    pub fn aggregate(
+        quorum: &WriteCertificateQuorum,
+        commitment: [u8; 32],
+        epoch: mika_types::epoch::Epoch,
+    ) -> Result<Self> {
+        if quorum.blob_id
+            != quorum
+                .certificates
+                .first()
+                .map(|c| c.blob_id)
+                .unwrap_or(BlobID([0u8; 32]))
+        {
+            return Err(MikaStorageError::Crypto("mixed blobs in PoA quorum".into()));
         }
-        Ok(())
+        let mut verified = 0usize;
+        for cert in &quorum.certificates {
+            if cert.verify()? {
+                verified += 1;
+            }
+        }
+        let keys = distinct_public_keys(&quorum.certificates);
+        if (verified as u64) < mika_types::storage::MIN_POA_SIGNERS || keys < MIN_POA_SIGNERS_USIZE
+        {
+            return Err(MikaStorageError::InsufficientShards {
+                have: verified,
+                need: MIN_POA_SIGNERS_USIZE,
+            });
+        }
+        Ok(Self {
+            blob_id: quorum.blob_id,
+            commitment,
+            epoch,
+            signer_count: keys as u64,
+            certificates: quorum.certificates.clone(),
+        })
     }
 }
+
+const MIN_POA_SIGNERS_USIZE: usize = mika_types::storage::MIN_POA_SIGNERS as usize;
 
 #[cfg(test)]
 mod tests {
@@ -286,6 +327,50 @@ mod tests {
         q.sign_all(&keypair.private_key, CurveType::K256).unwrap();
         assert!(q.verify_all().unwrap());
         assert_eq!(q.verified_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn poa_aggregation_requires_distinct_signers() {
+        let blob_id = BlobID::from_content(b"poa test");
+        // Two distinct keys → quorum meets MIN_POA_SIGNERS.
+        let key_a = generate_keypair(CurveType::K256).unwrap();
+        let key_b = generate_keypair(CurveType::K256).unwrap();
+        let key_a_pub = key_a.public_key.clone();
+        let key_a_priv = key_a.private_key.to_string();
+        let mut q = WriteCertificateQuorum::new(blob_id, 6, 4, 2, 256);
+        for (key, node, shard) in [(key_a, "node-a", 0u32), (key_b, "node-b", 1u32)] {
+            let mut cert = WriteCertificate {
+                blob_id,
+                shard_index: shard,
+                node_id: node.into(),
+                epoch: 1,
+                sliver_hash: [7u8; 32],
+                signature: vec![],
+                public_key: key.public_key.clone(),
+                curve_type: "K256".into(),
+            };
+            cert.sign(&key.private_key, CurveType::K256).unwrap();
+            q.add(cert);
+        }
+        let poa = PoaCert::aggregate(&q, [3u8; 32], 100).unwrap();
+        assert_eq!(poa.blob_id, blob_id);
+        assert_eq!(poa.signer_count, 2);
+        assert_eq!(poa.certificates.len(), 2);
+        // One signer only → quorum not met.
+        let mut q2 = WriteCertificateQuorum::new(blob_id, 6, 4, 2, 256);
+        let mut cert = WriteCertificate {
+            blob_id,
+            shard_index: 0,
+            node_id: "solo".into(),
+            epoch: 1,
+            sliver_hash: [1u8; 32],
+            signature: vec![],
+            public_key: key_a_pub.clone(),
+            curve_type: "K256".into(),
+        };
+        cert.sign(&key_a_priv, CurveType::K256).unwrap();
+        q2.add(cert);
+        assert!(PoaCert::aggregate(&q2, [3u8; 32], 100).is_err());
     }
 
     #[test]
