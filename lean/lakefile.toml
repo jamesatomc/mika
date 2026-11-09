@@ -1,0 +1,10 @@
+name = "mika"
+version = "0.1.0"
+defaultTargets = ["mika-test"]
+
+[[leanLib]]
+name = "Mika"
+
+[[leanExe]]
+name = "mika-test"
+root = "Mika.Topology.Tests"
